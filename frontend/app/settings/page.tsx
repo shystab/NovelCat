@@ -8,7 +8,6 @@ import {
   ChevronLeft,
   Save,
   Cpu,
-  Key,
   Settings as SettingsIcon,
   CheckCircle2,
   AlertCircle,
@@ -31,6 +30,7 @@ import PersonaManager from "@/components/persona-manager";
 import { useTheme } from "@/hooks/use-theme";
 import ConfirmDialog from "@/components/confirm-dialog";
 import AppBackgroundLayers from "@/components/app-background-layers";
+import AIProviderManager from "@/components/ai-provider-manager";
 
 export default function SettingsPage() {
   const { theme, setTheme } = useTheme();
@@ -38,8 +38,6 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState<{ msg: string; ok: boolean } | null>(null);
-  const [apiKeyInput, setApiKeyInput] = useState("");
-  const [provider, setProvider] = useState<string>("deepseek");
   const [temperature, setTemperature] = useState(0.7);
   const [maxTokens, setMaxTokens] = useState(2000);
   const [activeTab, setActiveTab] = useState<"model" | "persona" | "knowledge" | "appearance">("model");
@@ -112,7 +110,6 @@ export default function SettingsPage() {
     try {
       const data = await api.getSettings();
       setSettings(data);
-      setProvider(data.ai_provider || "deepseek");
       setTemperature(data.temperature ?? 0.7);
       setMaxTokens(data.max_tokens ?? 2000);
       setSummaryAutoGenerate(data.summary_auto_generate ?? true);
@@ -251,7 +248,6 @@ export default function SettingsPage() {
     setSaving(true);
     try {
       const update: SettingsUpdate = {
-        ai_provider: provider,
         temperature,
         max_tokens: maxTokens,
         summary_auto_generate: summaryAutoGenerate,
@@ -270,12 +266,7 @@ export default function SettingsPage() {
         chat_use_chapter_rag: chatUseChapterRag,
         external_rag_weight: externalRagWeight,
       };
-      if (apiKeyInput) {
-        if (provider === "deepseek") update.deepseek_api_key = apiKeyInput;
-        else if (provider === "openai") update.openai_api_key = apiKeyInput;
-      }
       await api.updateSettings(update);
-      setApiKeyInput("");
       await loadSettings();
       showToast("配置已保存", true);
       return true;
@@ -497,26 +488,7 @@ export default function SettingsPage() {
               {/* ── AI 模型服务 ── */}
               {activeTab === "model" && (
                 <>
-                  {/* 供应商选择 */}
-                  <section className="space-y-5">
-                    <div className={`flex items-center space-x-2 border-b ${borderCls} pb-4`}>
-                      <div className={`w-1.5 h-6 ${accentBar} rounded-full`} />
-                      <h2 className={`text-lg font-bold ${headingTxt}`}>模型供应商</h2>
-                    </div>
-                    <div className={`p-5 rounded-lg border ${cardBg} space-y-4`}>
-                      <div className="space-y-3">
-                        <label className={`text-sm font-bold ${headingTxt}`}>选择 AI 服务商</label>
-                        <select
-                          value={provider}
-                          onChange={(e) => setProvider(e.target.value)}
-                          className={`w-full border rounded-md px-3 py-2 text-sm outline-none transition-all ${inputCls}`}
-                        >
-                          <option value="deepseek">DeepSeek - 极致性价比，中文创作首选</option>
-                          <option value="openai">OpenAI - 行业标杆，逻辑性极强</option>
-                        </select>
-                      </div>
-                    </div>
-                  </section>
+                  <AIProviderManager theme={theme} />
 
                   {currentUser?.is_admin && (
                     <section className="space-y-5">
@@ -585,44 +557,6 @@ export default function SettingsPage() {
                       </div>
                     </section>
                   )}
-
-                  {/* API Key */}
-                  <section className="space-y-5">
-                    <div className={`flex items-center space-x-2 border-b ${borderCls} pb-4`}>
-                      <div className={`w-1.5 h-6 ${accentBar} rounded-full`} />
-                      <h2 className={`text-lg font-bold ${headingTxt}`}>API 身份验证</h2>
-                    </div>
-                    <div className={`p-5 rounded-lg border ${cardBg} space-y-4`}>
-                      <div className="flex items-start space-x-4">
-                        <div className={`p-2 ${isDark ? 'bg-slate-800' : isSepia ? 'bg-amber-100' : 'bg-slate-100'} rounded-md ${mutedTxt}`}>
-                          <Key size={18} />
-                        </div>
-                        <div className="flex-1 space-y-4">
-                          <div className="space-y-1">
-                            <label className={`text-sm font-bold ${headingTxt}`}>
-                              {provider === "deepseek" ? "DeepSeek API Key" : "OpenAI API Key"}
-                            </label>
-                            <p className={`text-xs ${mutedTxt}`}>密钥将经过 AES-256 加密后存储在本地。</p>
-                          </div>
-                          <div className="relative group">
-                            <input
-                              type="password"
-                              value={apiKeyInput}
-                              onChange={(e) => setApiKeyInput(e.target.value)}
-                              placeholder={provider === "deepseek" ? (settings?.has_deepseek_key ? "•••••••••••••••• (已加密存储)" : "sk-...") : (settings?.has_openai_key ? "•••••••••••••••• (已加密存储)" : "sk-...")}
-                              className={`w-full border rounded-md px-3 py-2 text-sm outline-none transition-all font-mono ${inputCls}`}
-                            />
-                            {(provider === "deepseek" ? settings?.has_deepseek_key : settings?.has_openai_key) && !apiKeyInput && (
-                              <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center space-x-2 text-emerald-600 bg-emerald-50 px-2 py-1 rounded-md border border-emerald-100">
-                                <CheckCircle2 size={14} />
-                                <span className="text-xs font-bold">密钥已就绪</span>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </section>
 
                   {/* 生成参数 */}
                   <section className="space-y-5">

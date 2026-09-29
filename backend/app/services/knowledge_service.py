@@ -54,6 +54,7 @@ class KnowledgeService:
         self.model_name = model_name
         self.client = None
         self.embedding_model: SentenceTransformer | None = None
+        self._embedding_failed = False
 
         if not settings.ENABLE_LOCAL_EMBEDDINGS or chromadb is None or ChromaSettings is None:
             return
@@ -64,6 +65,17 @@ class KnowledgeService:
             path=self.persist_dir,
             settings=ChromaSettings(anonymized_telemetry=False),
         )
+
+    @property
+    def vector_enabled(self) -> bool:
+        return self.client is not None and self.embedding_model is not None
+
+    def ensure_ready(self) -> bool:
+        """按需加载 embedding 模型，失败后缓存结果避免重复冷启动。"""
+        if self.vector_enabled:
+            return True
+        if self._embedding_failed or self.client is None:
+            return False
         if settings.EMBEDDING_LOCAL_FILES_ONLY:
             os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
             os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
@@ -71,17 +83,15 @@ class KnowledgeService:
             from sentence_transformers import SentenceTransformer
 
             self.embedding_model = SentenceTransformer(
-                model_name,
+                self.model_name,
                 device=settings.EMBEDDING_DEVICE,
                 local_files_only=settings.EMBEDDING_LOCAL_FILES_ONLY,
             )
+            return True
         except Exception:
-            # 模型未缓存到本地，RAG 功能不可用，但不影响其他功能
+            self._embedding_failed = True
             self.embedding_model = None
-
-    @property
-    def vector_enabled(self) -> bool:
-        return self.client is not None and self.embedding_model is not None
+            return False
 
     def status(self) -> dict:
         return {
@@ -118,7 +128,7 @@ class KnowledgeService:
         document_id: int,
         chunks: Iterable[tuple[int, str]],
     ) -> int:
-        if not self.vector_enabled:
+        if not self.ensure_ready():
             return 0
         col = self.client.get_or_create_collection(self._external_collection_name(user_id, project_id))
 
@@ -162,7 +172,7 @@ class KnowledgeService:
 
     def search(self, *, user_id: str, project_id: str, query: str, top_k: int = 5) -> list[dict]:
         """旧版搜索（保持兼容性）"""
-        if not self.vector_enabled:
+        if not self.ensure_ready():
             return []
         col = self.client.get_or_create_collection(self._collection_name(user_id, project_id))
         q_emb = self.embedding_model.encode([query], normalize_embeddings=True).tolist()
@@ -187,7 +197,7 @@ class KnowledgeService:
         document_ids: list[int] | None = None,
     ) -> list[dict]:
         """搜索外部知识库（带权重过滤）"""
-        if not self.vector_enabled:
+        if not self.ensure_ready():
             return []
         # 尝试新集合，回退到旧集合
         try:
@@ -221,7 +231,7 @@ class KnowledgeService:
         top_k: int = 5,
     ) -> list[dict]:
         """搜索全书章节"""
-        if not self.vector_enabled:
+        if not self.ensure_ready():
             return []
         # 尝试新集合，回退到旧集合（book_ 前缀）
         try:
@@ -278,11 +288,10 @@ class KnowledgeService:
         chapter_id: int,
         chunks: Iterable[tuple[int, str]],
         chapter_title: str,
+        chapter_kind: str = "prose",
     ) -> int:
         """插入/更新章节向量"""
-        if self.embedding_model is None:
-            return 0
-        if self.client is None:
+        if not self.ensure_ready():
             return 0
         # 先删除旧向量
         self.delete_chapter(user_id=user_id, book_id=book_id, chapter_id=chapter_id)
@@ -299,6 +308,7 @@ class KnowledgeService:
                 "chapter_id": chapter_id,
                 "book_id": book_id,
                 "chapter_title": chapter_title,
+                "chapter_kind": chapter_kind,
                 "chunk_index": chunk_idx,
                 "source_type": "chapter",
             })

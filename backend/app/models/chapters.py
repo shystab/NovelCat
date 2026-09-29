@@ -12,6 +12,13 @@ class BaseChapter(SQLModel):
     content: Annotated[str, Field(index=True, description="章节内容")]  # 章节内容
     summary: Annotated[str, Field(default="", description="章节摘要")]  # 章节摘要
     order: Annotated[int, Field(default=0, description="章节顺序")]  # 章节顺序
+    kind: Annotated[
+        str,
+        Field(
+            default="prose",
+            description="章节类型：outline=大纲，prose=正文，note=笔记，reference=参考资料",
+        ),
+    ]  # 章节类型
 
 
 class Chapter(BaseChapter, table=True):
@@ -44,3 +51,4 @@ class ChapterUpdate(SQLModel):
     content: Annotated[str | None, Field(default=None, description="章节内容")]  # 章节内容
     summary: Annotated[str | None, Field(default=None, description="章节摘要")]  # 章节摘要
     order: Annotated[int | None, Field(default=None, description="章节顺序")]  # 章节顺序
+    kind: Annotated[str | None, Field(default=None, description="章节类型：outline/prose/note/reference")]

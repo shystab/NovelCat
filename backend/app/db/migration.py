@@ -8,6 +8,7 @@ from sqlmodel import Session, select, text
 
 from app.models.books import Book
 from app.models.chapters import Chapter
+from app.models.conversations import Conversation
 
 
 DEFAULT_BOOK_TITLE = "默认书籍"
@@ -73,6 +74,7 @@ def _fix_conversation_table(session: Session) -> None:
 def _migrate_columns(session: Session) -> None:
     _add_column_if_missing(session, "chapter", "book_id", "INTEGER REFERENCES book(id)")
     _add_column_if_missing(session, "chapter", "summary", "TEXT DEFAULT ''")
+    _add_column_if_missing(session, "chapter", "kind", "VARCHAR DEFAULT 'prose'")
 
     _add_column_if_missing(session, "setting", "ai_provider", "VARCHAR DEFAULT 'deepseek'")
     _add_column_if_missing(session, "setting", "user_id", "VARCHAR DEFAULT 'default_user'")
@@ -94,9 +96,14 @@ def _migrate_columns(session: Session) -> None:
     _add_column_if_missing(session, "setting", "suggest_use_external_rag", "BOOLEAN DEFAULT 0")
     _add_column_if_missing(session, "setting", "chat_use_chapter_rag", "BOOLEAN DEFAULT 1")
     _add_column_if_missing(session, "setting", "external_rag_weight", "INTEGER DEFAULT 30")
+    _add_column_if_missing(session, "setting", "ai_provider_profiles_migrated", "BOOLEAN DEFAULT 0")
 
     _add_column_if_missing(session, "conversation", "selected_doc_ids", "JSON DEFAULT '[]'")
+    _add_column_if_missing(session, "conversation", "book_id", "INTEGER REFERENCES book(id)")
+    _add_column_if_missing(session, "conversation", "archived", "BOOLEAN DEFAULT 0")
+    _add_column_if_missing(session, "conversation", "token_estimate", "INTEGER DEFAULT 0")
     _add_column_if_missing(session, "preset", "user_id", "VARCHAR DEFAULT 'default_user'")
+    _add_column_if_missing(session, "memorysummary", "author_decisions", "JSON DEFAULT '[]'")
 
     _add_column_if_missing(session, "user", "display_name", "VARCHAR")
     _add_column_if_missing(session, "user", "bio", "VARCHAR")
@@ -140,8 +147,44 @@ def _assign_orphan_chapters(session: Session, default_book_id: int) -> None:
     print(f"[Migration] Assigned {len(orphan_chapters)} orphan chapter(s) to book_id={default_book_id}")
 
 
+def _assign_orphan_conversations(session: Session) -> int:
+    """把历史遗留的 book_id=NULL 对话归入该用户的第一本书。"""
+    orphans = session.exec(select(Conversation).where(Conversation.book_id == None)).all()  # noqa: E711
+    if not orphans:
+        return 0
+
+    first_book_by_user: dict[str, int] = {}
+    assigned = 0
+    for conv in orphans:
+        book_id = first_book_by_user.get(conv.user_id)
+        if book_id is None:
+            book = session.exec(
+                select(Book).where(Book.user_id == conv.user_id).order_by(Book.id)
+            ).first()
+            book_id = book.id if book else None
+            if book_id is not None:
+                first_book_by_user[conv.user_id] = book_id
+        if book_id is not None:
+            conv.book_id = book_id
+            session.add(conv)
+            assigned += 1
+
+    if assigned:
+        session.commit()
+        print(f"[Migration] Assigned {assigned} orphan conversation(s) to their first book")
+    return assigned
+
+
 def run_startup_migration(session: Session) -> None:
     _migrate_columns(session)
+    # The new table is created by SQLModel before this function runs. Convert
+    # legacy per-provider key columns once so existing users keep working.
+    from app.crud.ai_provider_config_crud import ensure_legacy_provider_configs
+    from app.models.setting import Setting
+
+    for db_settings in session.exec(select(Setting)).all():
+        ensure_legacy_provider_configs(session, db_settings.user_id)
     default_book_id = _ensure_default_book(session)
     _assign_orphan_chapters(session, default_book_id)
+    _assign_orphan_conversations(session)
     _fix_conversation_table(session)

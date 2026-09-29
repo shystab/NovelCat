@@ -40,26 +40,6 @@ function loadSession(): SessionState | null {
   }
 }
 
-function escapeHtml(value: string) {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function textToEditorHtml(value: string) {
-  const trimmed = value.trim();
-  if (!trimmed) return "";
-  if (/<[a-z][\s\S]*>/i.test(trimmed)) return trimmed;
-  return trimmed
-    .split(/\n{2,}/)
-    .map(paragraph => paragraph.trim())
-    .filter(Boolean)
-    .map(paragraph => `<p>${escapeHtml(paragraph).replace(/\n/g, "<br />")}</p>`)
-    .join("");
-}
-
 function userInitials(user: AuthUser) {
   return (user.display_name || user.username || "?").slice(0, 2).toUpperCase();
 }
@@ -80,6 +60,7 @@ export default function Home() {
     background_blur: 0,
     background_dim: 22,
     editor_paper_opacity: 92,
+    font_size: 18,
   });
   const lastSavedRef = useRef("");
   const draftUserRef = useRef("default_user");
@@ -121,6 +102,7 @@ export default function Home() {
           background_blur: settings.background_blur ?? 0,
           background_dim: settings.background_dim ?? 22,
           editor_paper_opacity: settings.editor_paper_opacity ?? 92,
+          font_size: settings.font_size ?? 18,
           background_url: settings.background_image_path ? withAccessToken(`${apiBase}/settings/background?v=${encodeURIComponent(settings.background_image_path)}`) : undefined,
         });
       } catch {
@@ -369,23 +351,6 @@ export default function Home() {
     []
   );
 
-  const insertContent = (text: string) => {
-    const html = textToEditorHtml(text);
-    setContent((prev) => {
-      const nextContent = prev.trim() ? `${prev}<p></p>${html}` : html;
-      syncCurrentChapterDraft(nextContent);
-      return nextContent;
-    });
-    setStatus("未保存");
-  };
-
-  const replaceContent = (text: string) => {
-    const nextContent = textToEditorHtml(text);
-    setContent(nextContent);
-    syncCurrentChapterDraft(nextContent);
-    setStatus("未保存");
-  };
-
   const getEditorContent = useCallback(() => content, [content]);
 
   const syncCurrentChapterDraft = useCallback((nextContent: string) => {
@@ -454,6 +419,7 @@ export default function Home() {
         title: `第 ${nextOrder} 章`,
         content: "",
         order: nextOrder,
+        kind: "prose",
       });
       setChapters((current) => [...current, newChapter]);
       setSelectedChapterId(newChapter.id);
@@ -477,8 +443,14 @@ export default function Home() {
     return () => clearTimeout(timer);
   }, [content, selectedChapterId, autoSaveInterval, handleSave]);
 
-  const toggleLeft = () => setShowLeft((v) => !v);
-  const toggleRight = () => setShowRight((v) => !v);
+  const toggleLeft = () => {
+    if (window.innerWidth < 1120) setShowRight(false);
+    setShowLeft((v) => !v);
+  };
+  const toggleRight = () => {
+    if (window.innerWidth < 1120) setShowLeft(false);
+    setShowRight((v) => !v);
+  };
 
   useEffect(() => {
     const collapseForViewport = () => {
@@ -569,7 +541,7 @@ export default function Home() {
         position="absolute"
       />
       <div
-        className="relative z-10 grid flex-1 min-h-0 w-full"
+        className="novelcat-workspace-grid relative z-10 grid flex-1 min-h-0 w-full"
         style={{ gridTemplateColumns }}
       >
 
@@ -704,8 +676,7 @@ export default function Home() {
           style={{ display: showRight ? undefined : "none" }}
         >
           <AIChat
-            onInsertContent={insertContent}
-            onReplaceContent={replaceContent}
+            hasBackground={Boolean(editorAppearance.background_url)}
             getEditorContent={getEditorContent}
             theme={theme}
             colors={colors}

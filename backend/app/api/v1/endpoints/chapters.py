@@ -86,6 +86,7 @@ async def generate_chapter_summary_background(
                     chapter_id=chapter_id,
                     chunks=list(enumerate(chunks)),
                     chapter_title=chapter.title,
+                    chapter_kind=chapter.kind or "prose",
                 )
                 if inserted:
                     print(f"Vectorized chapter {chapter_id} into {inserted} chunks")

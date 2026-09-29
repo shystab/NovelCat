@@ -1,6 +1,16 @@
 from .chapters import Chapter, ChapterCreate, ChapterUpdate, ChapterRead
 from .chapter_revisions import ChapterRevision, ChapterRevisionRead
 from .setting import Setting, SettingCreate, SettingUpdate, SettingResponse
+from .ai_provider_config import (
+    AIProviderConfig,
+    AIProviderConfigCreate,
+    AIProviderConfigUpdate,
+    AIProviderConfigRead,
+    AIProviderConfigList,
+    AIProviderTestResult,
+    AIProviderModelList,
+    AIProviderModelDiscoveryRequest,
+)
 from .memory import (
     PromptPreset,
     PromptPresetCreate,
@@ -32,6 +42,9 @@ __all__ = [
     "Chapter", "ChapterCreate", "ChapterUpdate", "ChapterRead",
     "ChapterRevision", "ChapterRevisionRead",
     "Setting", "SettingCreate", "SettingUpdate", "SettingResponse",
+    "AIProviderConfig", "AIProviderConfigCreate", "AIProviderConfigUpdate",
+    "AIProviderConfigRead", "AIProviderConfigList", "AIProviderTestResult", "AIProviderModelList",
+    "AIProviderModelDiscoveryRequest",
     "PromptPreset", "PromptPresetCreate", "PromptPresetUpdate", "PromptPresetRead",
     "MemorySummary", "MemorySummaryRead",
     "KnowledgeDocument", "KnowledgeChunk",

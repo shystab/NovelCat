@@ -1,11 +1,12 @@
 "use client";
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
+import { createPortal } from "react-dom";
 import Image from "next/image";
 import Link from "next/link";
 import { Chapter } from "@/types/api";
 import { api, authHeaders, withAccessToken } from "@/lib/api";
-import { ArrowDown, ArrowUp, Download, Plus, Search, Settings, Trash2, Pencil, Check, X, PanelLeftClose, FileText, GripVertical } from "lucide-react";
+import { ArrowDown, ArrowUp, Check, ChevronDown, Download, FileText, GripVertical, PanelLeftClose, Pencil, Plus, Search, Settings, Trash2, X } from "lucide-react";
 import type { Theme, ThemeColors } from "@/hooks/use-theme";
 import ConfirmDialog from "@/components/confirm-dialog";
 
@@ -41,6 +42,21 @@ function countNovelChars(value: string) {
 function formatCount(value: number) {
   if (value >= 10000) return `${(value / 10000).toFixed(value >= 100000 ? 0 : 1)} 万`;
   return value.toLocaleString();
+}
+
+type ChapterKind = NonNullable<Chapter["kind"]>;
+
+const CHAPTER_KINDS: Array<{ value: ChapterKind; label: string }> = [
+  { value: "outline", label: "大纲" },
+  { value: "prose", label: "正文" },
+  { value: "note", label: "笔记" },
+  { value: "reference", label: "资料" },
+];
+
+const CHAPTER_KIND_ORDER: ChapterKind[] = ["outline", "prose", "note", "reference"];
+
+function chapterKindLabel(kind: ChapterKind | undefined) {
+  return CHAPTER_KINDS.find(item => item.value === (kind || "prose"))?.label || "正文";
 }
 
 function escapeRegExp(value: string) {
@@ -274,6 +290,8 @@ export default function ChapterList({ bookId, chapters, onChaptersChange, onChap
   const [movingId, setMovingId] = useState<number | null>(null);
   const [dragId, setDragId] = useState<number | null>(null);
   const [dragOverId, setDragOverId] = useState<number | null>(null);
+  const [kindMenuChapterId, setKindMenuChapterId] = useState<number | null>(null);
+  const [kindMenuRect, setKindMenuRect] = useState<{ top: number; left: number; width: number } | null>(null);
   const editInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -291,6 +309,7 @@ export default function ChapterList({ bookId, chapters, onChaptersChange, onChap
         title: `第 ${nextOrder} 章`,
         content: "",
         order: nextOrder,
+        kind: "prose",
       });
       onChaptersChange([...chapters, newChapter]);
       onChapterSelect(newChapter.id);
@@ -368,6 +387,39 @@ export default function ChapterList({ bookId, chapters, onChaptersChange, onChap
     }
   };
 
+  const handleKindChange = async (chapter: Chapter, kind: ChapterKind) => {
+    try {
+      if (bookId) {
+        await api.updateChapterInBook(bookId, chapter.id, { kind });
+      } else {
+        await api.updateChapter(chapter.id, { kind });
+      }
+      onChaptersChange(chapters.map(c => c.id === chapter.id ? { ...c, kind } : c));
+    } catch (error) {
+      console.error("Failed to change chapter kind", error);
+    }
+  };
+
+  const closeKindMenu = () => {
+    setKindMenuChapterId(null);
+    setKindMenuRect(null);
+  };
+
+  const openKindMenu = (chapter: Chapter, e: React.MouseEvent<HTMLButtonElement>) => {
+    e.stopPropagation();
+    if (kindMenuChapterId === chapter.id) {
+      closeKindMenu();
+      return;
+    }
+    const rect = e.currentTarget.getBoundingClientRect();
+    setKindMenuChapterId(chapter.id);
+    setKindMenuRect({
+      top: rect.bottom + 4,
+      left: rect.left,
+      width: Math.max(rect.width, 104),
+    });
+  };
+
   const confirmDelete = async () => {
     if (!deleteTarget) return;
     setDeleting(true);
@@ -396,6 +448,16 @@ export default function ChapterList({ bookId, chapters, onChaptersChange, onChap
         return queryTerms.every(term => haystack.includes(term));
       })
     : orderedChapters;
+  const kindSections = CHAPTER_KIND_ORDER
+    .map(kind => ({
+      kind,
+      label: chapterKindLabel(kind),
+      items: visibleChapters.filter(chapter => (chapter.kind || "prose") === kind),
+    }))
+    .filter(section => section.items.length > 0);
+  const kindMenuChapter = kindMenuChapterId !== null
+    ? chapters.find(chapter => chapter.id === kindMenuChapterId) ?? null
+    : null;
   const totalChars = chapters.reduce((sum, chapter) => sum + countNovelChars(chapter.content), 0);
 
   // ── 拖拽排序 ─────────────────────────────────────
@@ -446,6 +508,134 @@ export default function ChapterList({ bookId, chapters, onChaptersChange, onChap
   const handleDragEnd = () => {
     setDragId(null);
     setDragOverId(null);
+  };
+
+  const renderChapterRow = (chapter: Chapter) => {
+    const fullIndex = orderedChapters.findIndex(item => item.id === chapter.id);
+    const isFirst = fullIndex <= 0;
+    const isLast = fullIndex === orderedChapters.length - 1;
+    const charCount = countNovelChars(chapter.content);
+    const summary = chapter.summary?.trim();
+    const snippet = query ? searchSnippet(chapter, queryTerms) : null;
+
+    return (
+      <li
+        key={chapter.id}
+        role="button"
+        tabIndex={0}
+        draggable={editingId !== chapter.id}
+        onDragStart={() => handleDragStart(chapter.id)}
+        onDragOver={(e) => handleDragOver(e, chapter.id)}
+        onDragLeave={handleDragLeave}
+        onDrop={(e) => { void handleDrop(e, chapter.id); }}
+        onDragEnd={handleDragEnd}
+        onClick={() => editingId !== chapter.id && onChapterSelect(chapter.id)}
+        onKeyDown={(event) => {
+          if (editingId === chapter.id) return;
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            onChapterSelect(chapter.id);
+          }
+        }}
+        className={`group relative px-3 py-2 cursor-pointer rounded-lg transition-all ${
+          selectedChapterId === chapter.id
+            ? `${selectedBgClass} shadow-sm ring-1`
+            : dragOverId === chapter.id
+              ? `${hoverBgClass} ring-1 ring-blue-400/50`
+              : hoverBgClass
+        }`}
+      >
+        {editingId === chapter.id ? (
+          <div className="flex items-center space-x-1" onClick={e => e.stopPropagation()}>
+            <input
+              ref={editInputRef}
+              value={editingTitle}
+              onChange={e => setEditingTitle(e.target.value)}
+              onKeyDown={handleEditKeyDown}
+              className={`flex-1 text-xs bg-transparent border-b ${theme === 'dark' ? 'border-slate-600' : theme === 'sepia' ? 'border-amber-500' : 'border-slate-400'} focus:outline-none ${headingClass} py-0.5`}
+            />
+            <button onClick={confirmEdit} className="p-1 text-emerald-500 hover:text-emerald-700" type="button"><Check size={12} /></button>
+            <button onClick={cancelEdit} className={`p-1 ${mutedClass}`} type="button"><X size={12} /></button>
+          </div>
+        ) : (
+          <div className="space-y-1">
+            <div className="flex items-center space-x-2">
+              <GripVertical size={12} className={`shrink-0 opacity-30 group-hover:opacity-60 transition-opacity cursor-grab active:cursor-grabbing ${mutedClass}`} />
+              <span className={`text-[10px] font-bold shrink-0 w-4 text-right ${
+                selectedChapterId === chapter.id ? textClass : mutedClass
+              }`}>
+                {String(fullIndex + 1).padStart(2, "0")}
+              </span>
+              <span className={`flex-1 text-xs truncate ${
+                selectedChapterId === chapter.id ? `${headingClass} font-semibold` : textClass
+              }`}>
+                {chapter.title}
+                {chapter.kind && chapter.kind !== "prose" ? ` · ${chapterKindLabel(chapter.kind)}` : ""}
+              </span>
+              <span className={`text-[10px] tabular-nums shrink-0 ${mutedClass}`}>
+                {formatCount(charCount)}
+              </span>
+              <div className="flex shrink-0 items-center space-x-0.5 opacity-55 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+                <button
+                  onClick={(e) => openKindMenu(chapter, e)}
+                  className={`inline-flex h-5 shrink-0 items-center gap-0.5 rounded border px-1 text-[9px] font-medium ${mutedClass} ${borderClass} transition-colors ${hoverTextClass}`}
+                  title="章节类型"
+                  aria-label={`设置章节类型：${chapter.title}`}
+                  type="button"
+                >
+                  {chapterKindLabel(chapter.kind)}
+                  <ChevronDown size={9} className={`transition-transform ${kindMenuChapterId === chapter.id ? "rotate-180" : ""}`} />
+                </button>
+                <button
+                  onClick={(e) => handleMoveChapter(chapter, "up", e)}
+                  disabled={isFirst || movingId === chapter.id}
+                  className={`p-1 ${mutedClass} ${hoverTextClass} rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed`}
+                  type="button"
+                  title="上移"
+                >
+                  <ArrowUp size={10} />
+                </button>
+                <button
+                  onClick={(e) => handleMoveChapter(chapter, "down", e)}
+                  disabled={isLast || movingId === chapter.id}
+                  className={`p-1 ${mutedClass} ${hoverTextClass} rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed`}
+                  type="button"
+                  title="下移"
+                >
+                  <ArrowDown size={10} />
+                </button>
+                <button
+                  onClick={(e) => startEdit(chapter, e)}
+                  className={`p-1 ${mutedClass} ${hoverTextClass} rounded transition-colors`}
+                  type="button"
+                  title="重命名"
+                >
+                  <Pencil size={10} />
+                </button>
+                <button
+                  onClick={(e) => handleDelete(chapter, e)}
+                  className={`p-1 ${mutedClass} hover:text-red-500 rounded transition-colors`}
+                  type="button"
+                  title="删除"
+                >
+                  <Trash2 size={10} />
+                </button>
+              </div>
+            </div>
+            {snippet ? (
+              <div className={`ml-6 line-clamp-2 text-[10px] leading-4 ${mutedClass}`}>
+                <span className="font-semibold">{snippet.label}：</span>
+                {highlightedText(snippet.text, queryTerms, markClass)}
+              </div>
+            ) : summary && (
+              <div className={`ml-6 line-clamp-2 text-[10px] leading-4 ${mutedClass}`}>
+                {summary}
+              </div>
+            )}
+          </div>
+        )}
+      </li>
+    );
   };
 
   const bgClass = theme === 'dark' ? 'bg-slate-900' : theme === 'sepia' ? 'bg-amber-50/80' : 'bg-slate-50/60';
@@ -542,122 +732,18 @@ export default function ChapterList({ bookId, chapters, onChaptersChange, onChap
             <p className={`text-xs ${mutedClass} opacity-70`}>换个关键词试试</p>
           </div>
         ) : (
-          <ul className="space-y-0.5">
-            {visibleChapters.map((chapter) => {
-              const fullIndex = orderedChapters.findIndex(item => item.id === chapter.id);
-              const isFirst = fullIndex <= 0;
-              const isLast = fullIndex === orderedChapters.length - 1;
-              const charCount = countNovelChars(chapter.content);
-              const summary = chapter.summary?.trim();
-              const snippet = query ? searchSnippet(chapter, queryTerms) : null;
-
-              return (
-              <li
-                key={chapter.id}
-                role="button"
-                tabIndex={0}
-                draggable={editingId !== chapter.id}
-                onDragStart={() => handleDragStart(chapter.id)}
-                onDragOver={(e) => handleDragOver(e, chapter.id)}
-                onDragLeave={handleDragLeave}
-                onDrop={(e) => { void handleDrop(e, chapter.id); }}
-                onDragEnd={handleDragEnd}
-                onClick={() => editingId !== chapter.id && onChapterSelect(chapter.id)}
-                onKeyDown={(event) => {
-                  if (editingId === chapter.id) return;
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    onChapterSelect(chapter.id);
-                  }
-                }}
-                className={`group relative px-3 py-2 cursor-pointer rounded-lg transition-all ${
-                  selectedChapterId === chapter.id
-                    ? `${selectedBgClass} shadow-sm ring-1`
-                    : dragOverId === chapter.id
-                      ? `${hoverBgClass} ring-1 ring-blue-400/50`
-                      : hoverBgClass
-                }`}
-              >
-                {editingId === chapter.id ? (
-                  <div className="flex items-center space-x-1" onClick={e => e.stopPropagation()}>
-                    <input
-                      ref={editInputRef}
-                      value={editingTitle}
-                      onChange={e => setEditingTitle(e.target.value)}
-                      onKeyDown={handleEditKeyDown}
-                      className={`flex-1 text-xs bg-transparent border-b ${theme === 'dark' ? 'border-slate-600' : theme === 'sepia' ? 'border-amber-500' : 'border-slate-400'} focus:outline-none ${headingClass} py-0.5`}
-                    />
-                    <button onClick={confirmEdit} className="p-1 text-emerald-500 hover:text-emerald-700" type="button"><Check size={12} /></button>
-                    <button onClick={cancelEdit} className={`p-1 ${mutedClass}`} type="button"><X size={12} /></button>
-                  </div>
-                ) : (
-                  <div className="space-y-1">
-                    <div className="flex items-center space-x-2">
-                      <GripVertical size={12} className={`shrink-0 opacity-30 group-hover:opacity-60 transition-opacity cursor-grab active:cursor-grabbing ${mutedClass}`} />
-                      <span className={`text-[10px] font-bold shrink-0 w-4 text-right ${
-                        selectedChapterId === chapter.id ? textClass : mutedClass
-                      }`}>
-                        {String(fullIndex + 1).padStart(2, "0")}
-                      </span>
-                      <span className={`flex-1 text-xs truncate ${
-                        selectedChapterId === chapter.id ? `${headingClass} font-semibold` : textClass
-                      }`}>
-                        {chapter.title}
-                      </span>
-                      <span className={`text-[10px] tabular-nums shrink-0 ${mutedClass}`}>
-                        {formatCount(charCount)}
-                      </span>
-                      <div className="flex shrink-0 items-center space-x-0.5 opacity-55 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
-                          <button
-                            onClick={(e) => handleMoveChapter(chapter, "up", e)}
-                            disabled={isFirst || movingId === chapter.id}
-                            className={`p-1 ${mutedClass} ${hoverTextClass} rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed`}
-                            type="button"
-                            title="上移"
-                          >
-                            <ArrowUp size={10} />
-                          </button>
-                          <button
-                            onClick={(e) => handleMoveChapter(chapter, "down", e)}
-                            disabled={isLast || movingId === chapter.id}
-                            className={`p-1 ${mutedClass} ${hoverTextClass} rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed`}
-                            type="button"
-                            title="下移"
-                          >
-                            <ArrowDown size={10} />
-                          </button>
-                          <button
-                            onClick={(e) => startEdit(chapter, e)}
-                            className={`p-1 ${mutedClass} ${hoverTextClass} rounded transition-colors`}
-                            type="button"
-                            title="重命名"
-                          >
-                            <Pencil size={10} />
-                          </button>
-                          <button
-                            onClick={(e) => handleDelete(chapter, e)}
-                            className={`p-1 ${mutedClass} hover:text-red-500 rounded transition-colors`}
-                            type="button"
-                            title="删除"
-                          >
-                            <Trash2 size={10} />
-                          </button>
-                      </div>
-                    </div>
-                    {snippet ? (
-                      <div className={`ml-6 line-clamp-2 text-[10px] leading-4 ${mutedClass}`}>
-                        <span className="font-semibold">{snippet.label}：</span>
-                        {highlightedText(snippet.text, queryTerms, markClass)}
-                      </div>
-                    ) : summary && (
-                      <div className={`ml-6 line-clamp-2 text-[10px] leading-4 ${mutedClass}`}>
-                        {summary}
-                      </div>
-                    )}
-                  </div>
-                )}
+          <ul className="space-y-1">
+            {kindSections.map(section => (
+              <li key={section.kind}>
+                <div className={`px-2 pb-1 pt-2 text-[10px] font-medium ${mutedClass}`}>
+                  {section.label}
+                  <span className="ml-1 opacity-60 tabular-nums">{section.items.length}</span>
+                </div>
+                <ul className="space-y-0.5">
+                  {section.items.map(renderChapterRow)}
+                </ul>
               </li>
-            )})}
+            ))}
           </ul>
         )}
       </div>
@@ -700,6 +786,45 @@ export default function ChapterList({ bookId, chapters, onChaptersChange, onChap
         onConfirm={confirmDelete}
         onCancel={() => setDeleteTarget(null)}
       />
+
+      {kindMenuChapter && kindMenuRect && document.body && createPortal(
+        <>
+          <div className="fixed inset-0 z-[9998]" onClick={closeKindMenu} />
+          <div
+            className="fixed z-[9999] overflow-hidden rounded-lg border shadow-lg"
+            style={{
+              top: kindMenuRect.top,
+              left: kindMenuRect.left,
+              width: kindMenuRect.width,
+              backgroundColor: theme === 'dark' ? '#1e293b' : theme === 'sepia' ? '#fffbeb' : '#ffffff',
+              borderColor: theme === 'dark' ? '#334155' : theme === 'sepia' ? '#fde68a' : '#e2e8f0',
+            }}
+          >
+            {CHAPTER_KINDS.map(item => {
+              const active = (kindMenuChapter.kind || "prose") === item.value;
+              return (
+                <button
+                  key={item.value}
+                  onClick={() => {
+                    void handleKindChange(kindMenuChapter, item.value);
+                    closeKindMenu();
+                  }}
+                  className={`flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-xs transition-colors ${
+                    active
+                      ? theme === 'dark' ? 'bg-slate-800 text-slate-100' : theme === 'sepia' ? 'bg-amber-100 text-amber-900' : 'bg-slate-100 text-slate-800'
+                      : theme === 'dark' ? 'text-slate-300 hover:bg-slate-800' : theme === 'sepia' ? 'text-amber-700 hover:bg-amber-100' : 'text-slate-600 hover:bg-slate-50'
+                  }`}
+                  type="button"
+                >
+                  <span>{item.label}</span>
+                  {active && <Check size={11} className="shrink-0 text-emerald-500" />}
+                </button>
+              );
+            })}
+          </div>
+        </>,
+        document.body
+      )}
     </div>
   );
 }

@@ -30,6 +30,7 @@ export interface Chapter {
   content: string;
   summary?: string;
   order: number;
+  kind?: "outline" | "prose" | "note" | "reference";
   book_id?: number;
   create_time: string;
   update_time: string;
@@ -39,12 +40,14 @@ export interface ChapterCreate {
   title: string;
   content: string;
   order?: number;
+  kind?: "outline" | "prose" | "note" | "reference";
 }
 
 export interface ChapterUpdate {
   title?: string;
   content?: string;
   order?: number;
+  kind?: "outline" | "prose" | "note" | "reference";
 }
 
 export interface ChapterRevision {
@@ -57,12 +60,21 @@ export interface ChapterRevision {
 }
 
 // ── 对话 ──────────────────────────────────────────
+export interface ConversationMessage {
+  role: string;
+  content: string;
+  meta?: Record<string, unknown>;
+}
+
 export interface Conversation {
   id: number;
   user_id: string;
+  book_id?: number | null;
   title: string;
-  messages: Array<{ role: string; content: string }>;
+  messages: ConversationMessage[];
   selected_doc_ids: number[];
+  archived: boolean;
+  token_estimate: number;
   create_time: string;
   update_time: string;
 }
@@ -70,13 +82,17 @@ export interface Conversation {
 export interface ConversationCreate {
   title?: string;
   user_id?: string;
-  messages?: Array<{ role: string; content: string }>;
+  book_id?: number | null;
+  messages?: ConversationMessage[];
 }
 
 export interface ConversationUpdate {
   title?: string;
-  messages?: Array<{ role: string; content: string }>;
+  messages?: ConversationMessage[];
   selected_doc_ids?: number[];
+  book_id?: number | null;
+  archived?: boolean;
+  token_estimate?: number;
 }
 
 // ── Auth ────────────────────────────────────────
@@ -294,10 +310,72 @@ export interface EditorAppearance {
   background_blur: number;
   background_dim: number;
   editor_paper_opacity: number;
+  font_size?: number;
   background_url?: string;
 }
 
+export type AIProviderKind = "deepseek" | "openai" | "openai_compatible";
+export type AIProviderTestStatus = "untested" | "success" | "failed";
+
+export interface AIProviderConfig {
+  id: number;
+  name: string;
+  provider: AIProviderKind;
+  base_url: string;
+  model: string;
+  is_active: boolean;
+  has_api_key: boolean;
+  api_key_hint?: string | null;
+  key_source: "stored" | "environment" | "missing";
+  last_test_status: AIProviderTestStatus;
+  last_test_message?: string | null;
+  last_tested_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AIProviderConfigList {
+  items: AIProviderConfig[];
+  active_id?: number | null;
+}
+
+export interface AIProviderConfigCreate {
+  name: string;
+  provider: AIProviderKind;
+  base_url: string;
+  model: string;
+  api_key?: string;
+  activate?: boolean;
+}
+
+export interface AIProviderConfigUpdate {
+  name?: string;
+  provider?: AIProviderKind;
+  base_url?: string;
+  model?: string;
+  api_key?: string;
+}
+
+export interface AIProviderTestResult {
+  ok: boolean;
+  message: string;
+  model_count: number;
+  tested_at: string;
+}
+
+export interface AIProviderModelList {
+  items: string[];
+  selected_model: string;
+}
+
+export interface AIProviderModelDiscoveryRequest {
+  config_id?: number;
+  base_url: string;
+  api_key?: string;
+}
+
 export interface AIWSRequest {
+  draft_reference?: { label: string; text: string; scope: "whole" | "opening_two" | "last_paragraph" };
   type: "suggest" | "chat";
   task?: string;
   content?: string;
@@ -316,6 +394,7 @@ export interface AIWSRequest {
   use_chapter_rag?: boolean;
   external_rag_weight?: number;
   current_chapter_id?: number;
+  conversation_id?: number;
   selected_doc_ids?: number[];
   preset_id?: number;
   book_id?: number;
@@ -356,6 +435,8 @@ export interface AIAgentStep {
   title: string;
   detail?: string;
   query?: string;
+  args?: Record<string, string | number | boolean>;
+  elapsed_ms?: number;
   content?: string;
 }
 
@@ -390,4 +471,20 @@ export interface PersonaUpdate {
   name?: string;
   system_prompt?: string;
   enabled?: boolean;
+}
+
+// 设置页与 AI 面板使用的全局写作人格。
+export interface WritingPreset {
+  id: number;
+  name: string;
+  description: string;
+  system_prompt: string;
+  is_enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WritingPresetListResponse {
+  items: WritingPreset[];
+  total: number;
 }

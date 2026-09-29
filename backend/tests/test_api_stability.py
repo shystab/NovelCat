@@ -61,6 +61,9 @@ class ApiStabilityTests(unittest.TestCase):
         self.patches.enter_context(patch("app.api.v1.endpoints.books.write_project_manifest"))
         self.patches.enter_context(patch("app.api.v1.endpoints.books.write_chapter_file"))
         self.patches.enter_context(patch("app.api.v1.endpoints.books.delete_chapter_files"))
+        # API tests use an in-memory database. Background workers otherwise
+        # open the real database and can invoke a configured external model.
+        self.patches.enter_context(patch("app.api.v1.endpoints.chapters.generate_chapter_summary_background"))
 
     def tearDown(self) -> None:
         self.patches.close()
@@ -190,6 +193,185 @@ class ApiStabilityTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertFalse(response.json()["configured"])
 
+    def test_ai_provider_configs_migrate_legacy_key_and_stay_private(self) -> None:
+        admin, member = self.create_invited_user()
+        admin_headers = self.auth_headers(admin)
+        member_headers = self.auth_headers(member)
+
+        legacy = self.client.patch(
+            "/api/v1/settings/",
+            json={"ai_provider": "deepseek", "deepseek_api_key": "legacy-secret-1234"},
+            headers=admin_headers,
+        )
+        self.assertEqual(legacy.status_code, 200, legacy.text)
+
+        migrated = self.client.get("/api/v1/ai/providers/", headers=admin_headers)
+        self.assertEqual(migrated.status_code, 200, migrated.text)
+        self.assertEqual(len(migrated.json()["items"]), 1)
+        migrated_config = migrated.json()["items"][0]
+        self.assertTrue(migrated_config["is_active"])
+        self.assertTrue(migrated_config["has_api_key"])
+        self.assertEqual(migrated_config["api_key_hint"], "1234")
+        self.assertNotIn("api_key", migrated_config)
+        self.assertNotIn("api_key_enc", migrated_config)
+
+        created = self.client.post(
+            "/api/v1/ai/providers/",
+            json={
+                "name": "Local model",
+                "provider": "openai_compatible",
+                "base_url": "http://127.0.0.1:11434/v1/",
+                "model": "novel-model",
+                "api_key": "local-key-5678",
+                "activate": True,
+            },
+            headers=admin_headers,
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        created_config = created.json()
+        self.assertEqual(created_config["base_url"], "http://127.0.0.1:11434/v1")
+        self.assertTrue(created_config["is_active"])
+
+        health = self.client.get("/api/v1/ai/health", headers=admin_headers)
+        self.assertEqual(health.status_code, 200, health.text)
+        self.assertTrue(health.json()["configured"])
+        self.assertEqual(health.json()["profile_id"], created_config["id"])
+        self.assertEqual(health.json()["model"], "novel-model")
+
+        member_list = self.client.get("/api/v1/ai/providers/", headers=member_headers)
+        self.assertEqual(member_list.status_code, 200, member_list.text)
+        self.assertNotIn(created_config["id"], [item["id"] for item in member_list.json()["items"]])
+        self.assertEqual(
+            self.client.delete(
+                f"/api/v1/ai/providers/{created_config['id']}",
+                headers=member_headers,
+            ).status_code,
+            404,
+        )
+
+    def test_ai_provider_connection_test_and_models_endpoint(self) -> None:
+        admin = self.register("admin")
+        headers = self.auth_headers(admin)
+        self.client.get("/api/v1/settings/", headers=headers)
+        created = self.client.post(
+            "/api/v1/ai/providers/",
+            json={
+                "name": "Test API",
+                "provider": "openai_compatible",
+                "base_url": "https://models.example.test/v1",
+                "model": "writer-pro",
+                "api_key": "test-key-4321",
+                "activate": True,
+            },
+            headers=headers,
+        ).json()
+
+        with patch(
+            "app.api.v1.endpoints.ai_providers.discover_provider_models",
+            return_value=["writer-lite", "writer-pro"],
+        ) as discover_models:
+            models = self.client.get(
+                f"/api/v1/ai/providers/{created['id']}/models",
+                headers=headers,
+            )
+            draft_models = self.client.post(
+                "/api/v1/ai/providers/discover-models",
+                json={
+                    "config_id": created["id"],
+                    "base_url": "https://draft.example.test/v1/",
+                },
+                headers=headers,
+            )
+            unsaved_models = self.client.post(
+                "/api/v1/ai/providers/discover-models",
+                json={
+                    "base_url": "https://new.example.test/v1",
+                    "api_key": "new-key-1234",
+                },
+                headers=headers,
+            )
+            tested = self.client.post(
+                f"/api/v1/ai/providers/{created['id']}/test",
+                headers=headers,
+            )
+
+        self.assertEqual(models.status_code, 200, models.text)
+        self.assertEqual(models.json()["items"], ["writer-lite", "writer-pro"])
+        self.assertEqual(draft_models.status_code, 200, draft_models.text)
+        self.assertEqual(draft_models.json()["items"], ["writer-lite", "writer-pro"])
+        self.assertEqual(draft_models.json()["selected_model"], "writer-pro")
+        self.assertEqual(unsaved_models.status_code, 200, unsaved_models.text)
+        self.assertEqual(unsaved_models.json()["selected_model"], "")
+        discover_models.assert_any_call(
+            api_key="test-key-4321",
+            base_url="https://draft.example.test/v1",
+        )
+        discover_models.assert_any_call(
+            api_key="new-key-1234",
+            base_url="https://new.example.test/v1",
+        )
+        self.assertEqual(tested.status_code, 200, tested.text)
+        self.assertTrue(tested.json()["ok"])
+
+        refreshed = self.client.get("/api/v1/ai/providers/", headers=headers).json()
+        tested_config = next(item for item in refreshed["items"] if item["id"] == created["id"])
+        self.assertEqual(tested_config["last_test_status"], "success")
+
+    def test_ai_runtime_uses_active_provider_profile(self) -> None:
+        from app.services.ai_provider import AIProviderFactory, get_ai_provider
+
+        admin = self.register("admin")
+        headers = self.auth_headers(admin)
+        self.client.get("/api/v1/settings/", headers=headers)
+        created = self.client.post(
+            "/api/v1/ai/providers/",
+            json={
+                "name": "Runtime profile",
+                "provider": "openai_compatible",
+                "base_url": "https://runtime.example.test/v1",
+                "model": "novel-runtime-model",
+                "api_key": "runtime-key-9876",
+                "activate": True,
+            },
+            headers=headers,
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+
+        sentinel = object()
+        with Session(self.engine) as session, patch.object(
+            AIProviderFactory,
+            "get_provider",
+            return_value=sentinel,
+        ) as factory:
+            provider = get_ai_provider(session=session, user_id="admin")
+
+        self.assertIs(provider, sentinel)
+        factory.assert_called_once_with(
+            "openai_compatible",
+            api_key="runtime-key-9876",
+            base_url="https://runtime.example.test/v1",
+            model="novel-runtime-model",
+        )
+
+    def test_ai_health_does_not_use_a_different_provider_environment_key(self) -> None:
+        old_key = settings.DEEPSEEK_API_KEY
+        settings.DEEPSEEK_API_KEY = "server-deepseek-key"
+        try:
+            admin = self.register("admin")
+            headers = self.auth_headers(admin)
+            updated = self.client.patch(
+                "/api/v1/settings/",
+                json={"ai_provider": "openai"},
+                headers=headers,
+            )
+            self.assertEqual(updated.status_code, 200, updated.text)
+            response = self.client.get("/api/v1/ai/health", headers=headers)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["provider"], "openai")
+            self.assertFalse(response.json()["configured"])
+        finally:
+            settings.DEEPSEEK_API_KEY = old_key
+
     def test_chapter_revision_history_can_restore_and_stays_private(self) -> None:
         admin, member = self.create_invited_user()
         admin_headers = self.auth_headers(admin)
@@ -294,6 +476,52 @@ class ApiStabilityTests(unittest.TestCase):
         clear = self.client.delete("/api/v1/admin/login-cover", headers=admin_headers)
         self.assertEqual(clear.status_code, 204, clear.text)
         self.assertEqual(self.client.get("/api/v1/admin/login-cover").status_code, 404)
+
+    def test_conversations_can_be_scoped_to_a_book(self) -> None:
+        admin, _ = self.create_invited_user()
+        headers = self.auth_headers(admin)
+
+        book_one = self.client.post("/api/v1/books/", json={"title": "Book one"}, headers=headers)
+        book_two = self.client.post("/api/v1/books/", json={"title": "Book two"}, headers=headers)
+        self.assertEqual(book_one.status_code, 201, book_one.text)
+        self.assertEqual(book_two.status_code, 201, book_two.text)
+
+        conv_one = self.client.post(
+            "/api/v1/conversations/",
+            json={"title": "Book one chat", "book_id": book_one.json()["id"]},
+            headers=headers,
+        )
+        conv_two = self.client.post(
+            "/api/v1/conversations/",
+            json={"title": "Book two chat", "book_id": book_two.json()["id"]},
+            headers=headers,
+        )
+        self.assertEqual(conv_one.status_code, 201, conv_one.text)
+        self.assertEqual(conv_two.status_code, 201, conv_two.text)
+        self.assertEqual(conv_one.json()["book_id"], book_one.json()["id"])
+        self.assertEqual(conv_two.json()["book_id"], book_two.json()["id"])
+
+        filtered = self.client.get(
+            f"/api/v1/conversations/?book_id={book_one.json()['id']}",
+            headers=headers,
+        )
+        self.assertEqual(filtered.status_code, 200, filtered.text)
+        titles = [conv["title"] for conv in filtered.json()]
+        self.assertIn("Book one chat", titles)
+        self.assertNotIn("Book two chat", titles)
+
+        archived = self.client.patch(
+            f"/api/v1/conversations/{conv_one.json()['id']}",
+            json={"archived": True},
+            headers=headers,
+        )
+        self.assertEqual(archived.status_code, 200, archived.text)
+        self.assertTrue(archived.json()["archived"])
+        hidden = self.client.get(
+            f"/api/v1/conversations/?book_id={book_one.json()['id']}",
+            headers=headers,
+        )
+        self.assertNotIn("Book one chat", [conv["title"] for conv in hidden.json()])
 
 
 if __name__ == "__main__":

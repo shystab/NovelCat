@@ -139,13 +139,20 @@ AUTH_REQUIRED=true
 
 没有 API Key 时仍可管理书籍、编辑章节、使用用户主页和管理知识库，但 AI 对话与生成能力不可用。
 
-推荐直接在 NovelCat 设置页填写 DeepSeek 或 OpenAI 兼容服务配置。也可以编辑 `backend/.env`：
+推荐直接在“设置 → AI 模型服务”中管理：
+
+- 可以保存多条 DeepSeek、OpenAI 或 OpenAI 兼容服务。
+- 每条服务独立保存 Base URL、模型和加密后的 API Key。
+- “获取模型列表”会读取服务商的 `/models` 接口；服务商不支持时仍可手动填写模型名。
+- “测试连接”会区分密钥已保存和连接已验证；设为当前服务后，AI 对话会使用该条配置。
+
+旧版本在设置页保存的 DeepSeek/OpenAI 密钥会在升级后自动迁移。也可以继续通过 `backend/.env` 提供默认配置：
 
 ```env
 AI_PROVIDER=deepseek
 DEEPSEEK_API_KEY=your-deepseek-api-key
 DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-chat
+DEEPSEEK_MODEL=deepseek-flash
 ```
 
 API Key 只应保存在你的电脑或服务器中，不要提交到 GitHub。

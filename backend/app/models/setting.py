@@ -39,6 +39,7 @@ class SettingBase(SQLModel):
 class Setting(SettingBase, table=True):
     """数据库表模型 - 对应数据库中的 setting 表"""
     id: Annotated[int | None, Field(default=None, primary_key=True)]  # 主键
+    ai_provider_profiles_migrated: Annotated[bool, Field(default=False, description="旧 AI 密钥是否已迁移为服务配置")]
 
 
 class SettingCreate(SettingBase):

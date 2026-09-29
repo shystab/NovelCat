@@ -2,6 +2,7 @@
 
 import { AlertTriangle, X } from "lucide-react";
 import type { Theme } from "@/hooks/use-theme";
+import ModalSurface from "@/components/modal-surface";
 
 interface ConfirmDialogProps {
   open: boolean;
@@ -52,8 +53,8 @@ export default function ConfirmDialog({
         : "bg-slate-100 text-slate-700 border-slate-200";
 
   return (
-    <div className="fixed inset-0 z-[1200] flex items-center justify-center bg-black/35 backdrop-blur-sm px-4">
-      <div className={`w-full max-w-sm rounded-lg border ${panelBg} shadow-xl overflow-hidden`}>
+    <ModalSurface open={open} onClose={onCancel} label={title} busy={busy}>
+      <div className={`w-full rounded-lg border ${panelBg} overflow-hidden`}>
         <div className="p-5">
           <div className="flex items-start gap-3">
             <div className={`shrink-0 p-2 rounded-md border ${iconTone}`}>
@@ -95,6 +96,6 @@ export default function ConfirmDialog({
           </button>
         </div>
       </div>
-    </div>
+    </ModalSurface>
   );
 }

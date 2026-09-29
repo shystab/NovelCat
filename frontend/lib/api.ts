@@ -29,6 +29,15 @@ import {
   ShowcaseCardUpdate,
   UserProfile,
   UserProfileUpdate,
+  WritingPreset,
+  WritingPresetListResponse,
+  AIProviderConfig,
+  AIProviderConfigCreate,
+  AIProviderConfigList,
+  AIProviderConfigUpdate,
+  AIProviderModelDiscoveryRequest,
+  AIProviderModelList,
+  AIProviderTestResult,
 } from "@/types/api";
 
 const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
@@ -304,7 +313,13 @@ export const api = {
     req<void>(`${BASE}/chapters/${id}`, { method: "DELETE" }),
 
   // ── Conversations ──────────────────────────────
-  listConversations: () => req<Conversation[]>(`${BASE}/conversations/`),
+  listConversations: (bookId?: number | null, includeArchived = false) => {
+    const params = new URLSearchParams();
+    if (bookId) params.set("book_id", String(bookId));
+    if (includeArchived) params.set("include_archived", "true");
+    const query = params.toString();
+    return req<Conversation[]>(`${BASE}/conversations/${query ? `?${query}` : ""}`);
+  },
   getConversation: (id: number) => req<Conversation>(`${BASE}/conversations/${id}`),
   createConversation: (data: ConversationCreate) =>
     req<Conversation>(`${BASE}/conversations/`, {
@@ -399,7 +414,52 @@ export const api = {
 
   // ── AI Agent ──────────────────────────────────
   getAiHealth: () =>
-    req<{ provider: string; configured: boolean; model: string; base_url: string }>(`${BASE}/ai/health`),
+    req<{
+      provider: string;
+      profile_id?: number | null;
+      profile_name?: string;
+      configured: boolean;
+      verified?: boolean;
+      status?: string;
+      model: string;
+      base_url: string;
+      key_source?: string;
+    }>(`${BASE}/ai/health`),
+
+  listAIProviders: () =>
+    req<AIProviderConfigList>(`${BASE}/ai/providers/`),
+  createAIProvider: (data: AIProviderConfigCreate) =>
+    req<AIProviderConfig>(`${BASE}/ai/providers/`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+  updateAIProvider: (id: number, data: AIProviderConfigUpdate) =>
+    req<AIProviderConfig>(`${BASE}/ai/providers/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+  deleteAIProvider: (id: number) =>
+    req<void>(`${BASE}/ai/providers/${id}`, { method: "DELETE" }),
+  activateAIProvider: (id: number) =>
+    req<AIProviderConfig>(`${BASE}/ai/providers/${id}/activate`, { method: "POST" }),
+  testAIProvider: (id: number) =>
+    req<AIProviderTestResult>(`${BASE}/ai/providers/${id}/test`, { method: "POST" }),
+  listAIProviderModels: (id: number) =>
+    req<AIProviderModelList>(`${BASE}/ai/providers/${id}/models`),
+  discoverAIProviderModels: (data: AIProviderModelDiscoveryRequest) =>
+    req<AIProviderModelList>(`${BASE}/ai/providers/discover-models`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+
+  listWritingPresets: () =>
+    req<WritingPresetListResponse>(`${BASE}/presets/`),
+
+  toggleWritingPreset: (id: number) =>
+    req<WritingPreset>(`${BASE}/presets/${id}/toggle`, { method: "PATCH" }),
 
   createAgentEditPlan: (data: AgentEditRequest) =>
     req<AgentEditPlan>(`${BASE}/ai/agent/edit-plan`, {

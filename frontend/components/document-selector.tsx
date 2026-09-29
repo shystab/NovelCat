@@ -5,6 +5,7 @@ import { api } from "@/lib/api";
 import { KnowledgeBase } from "@/types/api";
 import { X, FileText, Database, Check, Loader2 } from "lucide-react";
 import type { Theme } from "@/hooks/use-theme";
+import ModalSurface from "@/components/modal-surface";
 
 interface DocumentSelectorProps {
   conversationId: number | null;
@@ -34,7 +35,7 @@ export default function DocumentSelector({
   const bg = isDark ? "bg-slate-900 border-slate-700" : isSepia ? "bg-amber-50 border-amber-200" : "bg-white border-slate-200";
   const headerBg = isDark ? "bg-slate-900 border-slate-700" : isSepia ? "bg-amber-50 border-amber-200" : "bg-white border-slate-100";
   const headingTxt = isDark ? "text-slate-100" : isSepia ? "text-amber-900" : "text-slate-900";
-  const mutedTxt = isDark ? "text-slate-500" : isSepia ? "text-amber-500" : "text-slate-400";
+  const mutedTxt = isDark ? "text-slate-300" : isSepia ? "text-amber-800" : "text-slate-600";
   const itemBg = isDark ? "bg-slate-800 border-slate-700 hover:bg-slate-700" : isSepia ? "bg-amber-100/50 border-amber-200 hover:bg-amber-100" : "bg-white border-slate-200 hover:bg-slate-50";
   const selectedBg = isDark ? "bg-slate-700 border-slate-500" : isSepia ? "bg-amber-200 border-amber-400" : "bg-slate-50 border-slate-400";
   const iconBg = isDark ? "bg-slate-700 text-slate-300" : isSepia ? "bg-amber-200 text-amber-700" : "bg-slate-100 text-slate-500";
@@ -98,8 +99,8 @@ export default function DocumentSelector({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/40 backdrop-blur-sm">
-      <div className={`${bg} flex max-h-[80vh] w-full max-w-lg flex-col overflow-hidden rounded-lg border shadow-lg`}>
+    <ModalSurface open={isOpen} onClose={onClose} label="选择参考文档" busy={saving}>
+      <div className={`${bg} flex max-h-[80dvh] w-full flex-col overflow-hidden rounded-lg border`}>
         {/* 标题栏 */}
         <header className={`px-6 py-4 border-b ${headerBg} flex items-center justify-between shrink-0`}>
           <div className="flex items-center space-x-3">
@@ -155,7 +156,7 @@ export default function DocumentSelector({
         </main>
 
         {/* 底部操作 */}
-        <footer className={`px-6 py-4 border-t ${headerBg} flex items-center justify-between shrink-0`}>
+        <footer className={`px-6 py-4 border-t ${headerBg} flex flex-wrap gap-3 items-center justify-between shrink-0`}>
           <div>
             <span className={`text-xs ${mutedTxt}`}>
               已选 {selectedIds.size} 个文档{selectedIds.size === 0 ? "（不使用外部知识库）" : ""}
@@ -181,6 +182,6 @@ export default function DocumentSelector({
           </div>
         </footer>
       </div>
-    </div>
+    </ModalSurface>
   );
 }

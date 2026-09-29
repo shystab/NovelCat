@@ -3,7 +3,7 @@
 """
 import io
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, Body, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Path, Query, Body, status
 from fastapi.responses import StreamingResponse
 from sqlmodel import SQLModel, Session, select, func
 from typing import Annotated, List
@@ -70,6 +70,51 @@ def _parse_chapter_ids(ids: str | None) -> list[int] | None:
     if not parsed:
         raise HTTPException(status_code=422, detail="ids cannot be empty")
     return parsed
+
+
+def _schedule_chapter_vectorization(
+    background_tasks: BackgroundTasks,
+    chapter_id: int,
+    content: str,
+    force: bool,
+) -> None:
+    from app.api.v1.endpoints.chapters import generate_chapter_summary_background
+
+    background_tasks.add_task(
+        generate_chapter_summary_background,
+        chapter_id=chapter_id,
+        content=content,
+        force_regenerate=force,
+    )
+
+
+def refresh_setting_memory_background(
+    *,
+    book_id: int,
+    user_id: str,
+    chapter_id: int,
+    title: str,
+    content: str,
+    kind: str,
+) -> None:
+    """设定/大纲/笔记章节修改后，后台把变更合并进书级滚动记忆。"""
+    try:
+        from sqlmodel import Session
+
+        from app.db.session import engine
+        from app.services.ai_service import get_ai_service
+
+        with Session(engine) as session:
+            service = get_ai_service(session, user_id=user_id)
+            service.refresh_setting_memory(
+                user_id=user_id,
+                project_id=str(book_id),
+                title=title,
+                content=content,
+                kind=kind,
+            )
+    except Exception as exc:
+        print(f"Failed to refresh setting memory for chapter {chapter_id}: {exc}")
 
 
 def _export_chapters_for_book(session: Session, book_id: int, ids: str | None) -> list[Chapter]:
@@ -366,6 +411,7 @@ def list_chapters(
 def create_chapter_in_book(
     book_id: Annotated[int, Path(ge=1)],
     chapter_in: Annotated[ChapterCreate, Body()],
+    background_tasks: BackgroundTasks,
     session: Annotated[Session, Depends(get_session)],
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
 ):
@@ -374,6 +420,8 @@ def create_chapter_in_book(
     chapter_in.book_id = book_id
     chapter = create_chapter(session, chapter_in)
     write_chapter_file(chapter)
+    if chapter.content and chapter.content.strip():
+        _schedule_chapter_vectorization(background_tasks, chapter.id, chapter.content, False)
     return chapter
 
 
@@ -404,6 +452,7 @@ def update_chapter_in_book(
     book_id: Annotated[int, Path(ge=1)],
     chapter_id: Annotated[int, Path(ge=1)],
     chapter_in: Annotated[ChapterUpdate, Body()],
+    background_tasks: BackgroundTasks,
     session: Annotated[Session, Depends(get_session)],
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
 ):
@@ -415,6 +464,9 @@ def update_chapter_in_book(
         snapshot_chapter(session, chapter, current_user.username)
     updated = update_chapter(session, chapter, chapter_in)
     write_chapter_file(updated)
+    content_changed = chapter_in.content is not None and chapter_in.content.strip()
+    if content_changed:
+        _schedule_chapter_vectorization(background_tasks, updated.id, updated.content, True)
     return updated
 
 

@@ -25,6 +25,8 @@ def list_conversations(
     skip: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     include_empty: Annotated[bool, Query(description="是否包含无消息、无文档、默认标题的空对话")] = False,
+    book_id: Annotated[int | None, Query(ge=1, description="只返回属于该书籍的对话")] = None,
+    include_archived: Annotated[bool, Query(description="是否包含已归档对话")] = False,
 ):
     return conversation_crud.get_conversations(
         session,
@@ -32,6 +34,8 @@ def list_conversations(
         limit=limit,
         include_empty=include_empty,
         user_id=current_user.username,
+        book_id=book_id,
+        include_archived=include_archived,
     )
 
 

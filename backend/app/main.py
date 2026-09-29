@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import SQLModel, Session
 
-from app.api.v1.endpoints import admin, auth, chapters, settings, ai, memory, knowledge, finetune, presets, users
+from app.api.v1.endpoints import admin, auth, chapters, settings, ai, ai_providers, memory, knowledge, finetune, presets, users
 from app.api.v1.endpoints import books as books_ep, conversations as conversations_ep
 from app.db.session import engine
 from app.db.migration import run_startup_migration
@@ -76,6 +76,12 @@ app.include_router(
 )
 
 # 注册 AI 路由
+app.include_router(
+    ai_providers.router,
+    prefix=f"{app_settings.API_V1_STR}/ai/providers",
+    tags=["ai-providers"]
+)
+
 app.include_router(
     ai.router,
     prefix=f"{app_settings.API_V1_STR}/ai",

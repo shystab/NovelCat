@@ -168,10 +168,11 @@ def get_nearby_chapter_summaries(
 
     book_id = current_chapter.book_id
 
-    # 获取同一书籍中的所有章节，按顺序排序
+    # 获取同一书籍中的所有正文章节，按顺序排序；大纲/笔记/资料不参与正文承接
     all_chapters = session.exec(
         select(Chapter)
         .where(Chapter.book_id == book_id)
+        .where(Chapter.kind == "prose")
         .order_by(Chapter.order)
     ).all()
 
@@ -200,6 +201,7 @@ def get_nearby_chapter_summaries(
             "title": ch.title,
             "summary": ch.summary or "",
             "order": ch.order,
+            "kind": ch.kind or "prose",
             "is_before": i < current_idx
         })
 

@@ -19,7 +19,7 @@ router = APIRouter()
 
 def _require_vector_ready():
     ks = get_knowledge_service()
-    if not ks.vector_enabled:
+    if not ks.ensure_ready():
         raise HTTPException(
             status_code=503,
             detail="外部语料向量模型未就绪。请安装 requirements-vector.txt、开启 ENABLE_LOCAL_EMBEDDINGS，并确认模型已下载。",

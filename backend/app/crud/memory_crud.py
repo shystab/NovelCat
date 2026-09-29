@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 from sqlmodel import Session, select
 
 from app.models.memory import (
@@ -109,24 +110,33 @@ def upsert_memory_summary(session: Session, user_id: str, project_id: str, summa
     return obj
 
 
-def get_memory_summary(session: Session, user_id: str, project_id: str) -> MemorySummary | None:
-    stmt = (
-        select(MemorySummary)
-        .where(MemorySummary.user_id == user_id)
-        .where(MemorySummary.project_id == project_id)
-    )
-    return session.exec(stmt).first()
-
-
-def upsert_memory_summary(session: Session, user_id: str, project_id: str, summary: str) -> MemorySummary:
+def append_author_decision(
+    session: Session,
+    *,
+    user_id: str,
+    project_id: str,
+    text: str,
+    source_conversation_id: int | None = None,
+    max_items: int = 30,
+) -> MemorySummary:
+    """Persist an author's exact decision without asking a model to rewrite it."""
+    normalized = " ".join((text or "").split()).strip()
     obj = get_memory_summary(session, user_id=user_id, project_id=project_id)
     if obj is None:
-        obj = MemorySummary(user_id=user_id, project_id=project_id, summary=summary)
-    else:
-        obj.summary = summary
-        obj.updated_at = datetime.utcnow()
+        obj = MemorySummary(user_id=user_id, project_id=project_id, summary="")
 
-    session.add(obj)
-    session.commit()
-    session.refresh(obj)
+    decisions: list[dict[str, Any]] = list(obj.author_decisions or [])
+    if normalized and not any(str(item.get("text") or "").strip() == normalized for item in decisions):
+        decisions.append({
+            "text": normalized[:1200],
+            "source": "author_message",
+            "conversation_id": source_conversation_id,
+            "recorded_at": datetime.utcnow().isoformat(timespec="seconds"),
+        })
+        decisions = decisions[-max(5, min(int(max_items or 30), 100)):]
+        obj.author_decisions = decisions
+        obj.updated_at = datetime.utcnow()
+        session.add(obj)
+        session.commit()
+        session.refresh(obj)
     return obj

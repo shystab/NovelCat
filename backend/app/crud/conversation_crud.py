@@ -4,6 +4,7 @@
 from datetime import datetime
 from sqlmodel import Session, select
 from app.models.conversations import Conversation, ConversationCreate, ConversationUpdate
+from app.services.token_estimate import estimate_messages_tokens
 
 
 def get_conversation(session: Session, conversation_id: int, user_id: str | None = None) -> Conversation | None:
@@ -27,6 +28,8 @@ def get_conversations(
     limit: int = 50,
     include_empty: bool = False,
     user_id: str | None = None,
+    book_id: int | None = None,
+    include_archived: bool = False,
 ) -> list[Conversation]:
     statement = (
         select(Conversation)
@@ -34,6 +37,10 @@ def get_conversations(
     )
     if user_id is not None:
         statement = statement.where(Conversation.user_id == user_id)
+    if book_id is not None:
+        statement = statement.where(Conversation.book_id == book_id)
+    if not include_archived:
+        statement = statement.where(Conversation.archived == False)  # noqa: E712
     statement = statement.offset(skip).limit(limit if include_empty else max(limit * 4, 50))
     conversations = list(session.exec(statement).all())
     if include_empty:
@@ -44,6 +51,7 @@ def get_conversations(
 def create_conversation(session: Session, conv_in: ConversationCreate) -> Conversation:
     conv = Conversation(
         user_id=conv_in.user_id,
+        book_id=conv_in.book_id,
         title=conv_in.title,
         messages=[],
         selected_doc_ids=[],
@@ -58,6 +66,8 @@ def update_conversation(
     session: Session, conv: Conversation, conv_in: ConversationUpdate
 ) -> Conversation:
     conv_data = conv_in.model_dump(exclude_unset=True)
+    if "messages" in conv_data:
+        conv.token_estimate = estimate_messages_tokens(conv_data["messages"])
     for key, value in conv_data.items():
         setattr(conv, key, value)
     conv.update_time = datetime.now()

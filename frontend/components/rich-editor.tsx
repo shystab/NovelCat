@@ -1,6 +1,6 @@
 "use client";
 
-import { useEditor, EditorContent } from "@tiptap/react";
+import { useEditor, EditorContent, type Editor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
 import Heading from "@tiptap/extension-heading";
@@ -26,8 +26,11 @@ import {
   Quote,
   Code as CodeIcon,
   History,
+  LocateFixed,
+  Maximize2,
+  Minimize2,
 } from "lucide-react";
-import { useEffect, useCallback, useState } from "react";
+import { useEffect, useCallback, useRef, useState } from "react";
 import ChapterHistoryDialog from "@/components/chapter-history-dialog";
 
 interface RichEditorProps {
@@ -62,6 +65,15 @@ function estimateReadTime(words: number) {
   return mins < 1 ? "< 1 分钟" : `${mins} 分钟`;
 }
 
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 export default function RichEditor({
   chapter,
   content,
@@ -75,9 +87,77 @@ export default function RichEditor({
   onCreateChapter,
   theme,
   colors,
+  showLeft = true,
+  showRight = true,
+  onToggleLeft,
+  onToggleRight,
   appearance,
 }: RichEditorProps) {
   const [showHistory, setShowHistory] = useState(false);
+  const [glassPaper, setGlassPaper] = useState(() => {
+    if (typeof window === "undefined") return true;
+    try { return localStorage.getItem("novelcat-glass-paper") !== "false"; } catch { return true; }
+  });
+  const toggleGlassPaper = () => {
+    const next = !glassPaper;
+    setGlassPaper(next);
+    try { localStorage.setItem("novelcat-glass-paper", String(next)); } catch {}
+  };
+  const [typewriterMode, setTypewriterMode] = useState(() => {
+    if (typeof window === "undefined") return false;
+    try {
+      return localStorage.getItem("novelcat-typewriter-mode") === "true";
+    } catch {
+      return false;
+    }
+  });
+  const typewriterModeRef = useRef(typewriterMode);
+  const scrollAreaRef = useRef<HTMLElement>(null);
+  const caretFrameRef = useRef<number | null>(null);
+
+  const toggleTypewriterMode = useCallback(() => {
+    setTypewriterMode(current => {
+      const next = !current;
+      typewriterModeRef.current = next;
+      try {
+        localStorage.setItem("novelcat-typewriter-mode", String(next));
+      } catch {}
+      return next;
+    });
+  }, []);
+
+  const focusMode = !showLeft && !showRight;
+  const toggleFocusMode = useCallback(() => {
+    if (focusMode) {
+      onToggleLeft?.();
+      onToggleRight?.();
+      return;
+    }
+    if (showLeft) onToggleLeft?.();
+    if (showRight) onToggleRight?.();
+  }, [focusMode, onToggleLeft, onToggleRight, showLeft, showRight]);
+
+  const keepCaretInComfortZone = useCallback((editorInstance: Editor) => {
+    if (!typewriterModeRef.current || !editorInstance.isFocused) return;
+    if (caretFrameRef.current !== null) cancelAnimationFrame(caretFrameRef.current);
+    caretFrameRef.current = requestAnimationFrame(() => {
+      caretFrameRef.current = null;
+      const scrollArea = scrollAreaRef.current;
+      if (!scrollArea || !typewriterModeRef.current) return;
+      const bounds = scrollArea.getBoundingClientRect();
+      const caret = editorInstance.view.coordsAtPos(editorInstance.state.selection.head);
+      const upper = bounds.top + bounds.height * 0.28;
+      const lower = bounds.top + bounds.height * 0.68;
+      if (caret.top < upper || caret.bottom > lower) {
+        scrollArea.scrollTop += caret.top - (bounds.top + bounds.height * 0.44);
+      }
+    });
+  }, []);
+
+  useEffect(() => () => {
+    if (caretFrameRef.current !== null) cancelAnimationFrame(caretFrameRef.current);
+  }, []);
+
   const editor = useEditor({
     immediatelyRender: false,
     extensions: [
@@ -103,7 +183,9 @@ export default function RichEditor({
     content: content,
     onUpdate: ({ editor }) => {
       onChangeContent(editor.getHTML());
+      keepCaretInComfortZone(editor);
     },
+    onSelectionUpdate: ({ editor }) => keepCaretInComfortZone(editor),
     editorProps: {
       attributes: {
         class: "novel-writing-surface prose focus:outline-none min-h-full max-w-none",
@@ -120,7 +202,7 @@ export default function RichEditor({
 
         if (paragraphs.length > 0) {
           return paragraphs
-            .map(p => `<p>${p.trim().replace(/\n/g, "<br>")}</p>`)
+            .map(p => `<p>${escapeHtml(p.trim()).replace(/\n/g, "<br>")}</p>`)
             .join("");
         }
 
@@ -154,14 +236,22 @@ export default function RichEditor({
       e.preventDefault();
       editor?.commands.insertContent("　　");
     }
-  }, [editor, onSave]);
+    if (e.key.toLowerCase() === "l" && e.shiftKey && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      toggleTypewriterMode();
+    }
+    if (e.key.toLowerCase() === "f" && e.shiftKey && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      toggleFocusMode();
+    }
+  }, [editor, onSave, toggleFocusMode, toggleTypewriterMode]);
 
   const paragraphs = content.replace(/<[^>]+>/g, "\n").split(/\n+/).filter(p => p.trim()).length;
   const words = wordCount(content);
   const chars = content.replace(/<[^>]+>/g, "").length;
 
   const borderClass = theme === 'dark' ? 'border-slate-700/60' : theme === 'sepia' ? 'border-amber-200/50' : 'border-slate-100';
-  const textClass = theme === 'dark' ? 'text-slate-300' : theme === 'sepia' ? 'text-amber-700' : 'text-slate-700';
+  const textClass = theme === 'dark' ? 'text-slate-100' : theme === 'sepia' ? 'text-amber-950' : 'text-slate-950';
   const headingClass = theme === 'dark' ? 'text-slate-100' : theme === 'sepia' ? 'text-amber-900' : 'text-slate-800';
   const mutedClass = theme === 'dark' ? 'text-slate-500' : theme === 'sepia' ? 'text-amber-500/70' : 'text-slate-350';
   const toolbarBg = theme === 'dark' ? 'bg-slate-800/40' : theme === 'sepia' ? 'bg-amber-100/30' : 'bg-slate-50/80';
@@ -174,8 +264,8 @@ export default function RichEditor({
   } disabled:opacity-35 disabled:cursor-not-allowed`;
 
   const hasBackground = Boolean(appearance?.background_url);
-  const rawPaperOpacity = Math.min(Math.max(appearance?.editor_paper_opacity ?? 92, 55), 100) / 100;
-  const paperOpacity = hasBackground ? Math.min(rawPaperOpacity, 0.38) : rawPaperOpacity;
+  const editorFontSize = Math.min(Math.max(appearance?.font_size ?? 18, 14), 28);
+  const paperOpacity = hasBackground && glassPaper ? (theme === "dark" ? 0.7 : 0.5) : Math.min(Math.max(appearance?.editor_paper_opacity ?? 92, 55), 100) / 100;
   const paperBg = theme === 'dark'
     ? `rgba(15, 23, 42, ${paperOpacity})`
     : theme === 'sepia'
@@ -291,6 +381,27 @@ export default function RichEditor({
             >
               <CodeIcon size={13} />
             </button>
+            <div className="w-px h-3.5 bg-current opacity-15 mx-0.5" />
+            <button
+              onClick={toggleTypewriterMode}
+              className={`${toolbarBtn} ${typewriterMode ? toolbarBtnActive : 'hover:bg-black/5'}`}
+              title="光标跟随模式 (Ctrl+Shift+L)"
+              aria-label="切换光标跟随模式"
+              aria-pressed={typewriterMode}
+              type="button"
+            >
+              <LocateFixed size={13} />
+            </button>
+            <button
+              onClick={toggleFocusMode}
+              className={`${toolbarBtn} ${focusMode ? toolbarBtnActive : 'hover:bg-black/5'}`}
+              title={`${focusMode ? "退出" : "进入"}专注模式 (Ctrl+Shift+F)`}
+              aria-label={`${focusMode ? "退出" : "进入"}专注模式`}
+              aria-pressed={focusMode}
+              type="button"
+            >
+              {focusMode ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+            </button>
           </div>
 
           {/* 统计信息 */}
@@ -350,26 +461,24 @@ export default function RichEditor({
       </header>
 
       {/* 编辑区 — 舒适的阅读宽度 + 大行距 */}
-      <main className="flex-1 overflow-y-auto custom-scrollbar relative z-10" onKeyDown={handleKeyDown}>
+      <main ref={scrollAreaRef} className="flex-1 overflow-y-auto custom-scrollbar relative z-10" onKeyDown={handleKeyDown}>
         <div className="w-full max-w-[860px] mx-auto py-8 sm:py-12 px-4 sm:px-8 min-h-full">
           <div
-            className={`min-h-[72vh] rounded-[10px] ${hasBackground ? 'shadow-lg shadow-black/15 ring-1 ring-white/24 border border-white/18' : ''}`}
+            className={`novelcat-manuscript-sheet min-h-[72vh] rounded-[10px] ${hasBackground ? 'border border-slate-400/25' : ''}`}
+            data-theme={theme}
             style={{
               backgroundColor: hasBackground ? paperBg : 'transparent',
-              backdropFilter: hasBackground ? 'blur(18px) saturate(1.32) contrast(1.02)' : undefined,
-              boxShadow: hasBackground
-                ? 'inset 0 1px 0 rgba(255,255,255,0.56), inset 0 -1px 0 rgba(255,255,255,0.12), 0 24px 70px rgba(0,0,0,0.18)'
-                : undefined,
+              backdropFilter: hasBackground ? (glassPaper ? 'blur(14px) saturate(0.85)' : 'blur(12px)') : undefined,
             }}
           >
           <style>{`
             .novel-writing-surface {
-              font-size: 18px;
+              font-size: ${editorFontSize}px;
               line-height: 2.1;
               letter-spacing: 0;
               text-rendering: optimizeLegibility;
               caret-color: currentColor;
-              padding: ${hasBackground ? '3rem 3.25rem' : '0'};
+              padding: ${hasBackground ? '2.5rem clamp(1.25rem, 3vw, 3.25rem)' : '0'};
             }
             .novel-writing-surface p {
               margin: 0 0 0.8em;
@@ -410,7 +519,22 @@ export default function RichEditor({
       <div className={`px-6 py-2 border-t ${borderClass} flex items-center justify-between shrink-0 relative z-30 ${chromeBg}`}>
         <span className={`text-[10px] font-bold ${mutedClass} uppercase tracking-wider`}>{chars.toLocaleString()} 字符</span>
         <div className="flex items-center space-x-4">
-          <span className={`text-[10px] ${mutedClass} hidden sm:block`}>Tab 缩进 · Ctrl+Enter 保存</span>
+          {hasBackground && <button type="button" onClick={toggleGlassPaper} aria-pressed={glassPaper}
+            className="min-h-8 rounded-md px-2 text-xs text-slate-100 hover:bg-white/15"
+            title="磨砂模式透出背景；清晰模式使用设置里的纸张不透明度">
+            {glassPaper ? "背景磨砂" : "清晰纸张"}
+          </button>}
+          <button
+            type="button"
+            onClick={toggleTypewriterMode}
+            className={`hidden sm:inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] ${typewriterMode ? textClass : mutedClass}`}
+            aria-pressed={typewriterMode}
+            title="输入时让光标保持在编辑区舒适位置"
+          >
+            <LocateFixed size={10} />
+            光标跟随{typewriterMode ? "已开" : "已关"}
+          </button>
+          <span className={`text-[10px] ${mutedClass} hidden lg:block`}>Tab 缩进 · Ctrl+Enter 保存 · Ctrl+Shift+L 跟随 · Ctrl+Shift+F 专注</span>
         </div>
       </div>
       {showHistory && onRestoreChapter && (

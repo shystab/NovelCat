@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 
-from sqlmodel import Field, SQLModel
+from sqlmodel import Column, Field, JSON, SQLModel
 
 
 class PromptPresetBase(SQLModel):
@@ -44,6 +44,11 @@ class MemorySummary(SQLModel, table=True):
     user_id: Annotated[str, Field(index=True)]
     project_id: Annotated[str, Field(index=True)]
     summary: Annotated[str, Field(default="", description="写作记忆摘要（用于拼接上下文）")]
+    author_decisions: Annotated[list[dict[str, Any]], Field(
+        default_factory=list,
+        sa_column=Column(JSON),
+        description="作者明确确认、否定或推翻的决定原文；不允许由 AI 回答生成",
+    )]
     updated_at: Annotated[datetime, Field(default_factory=datetime.utcnow)]
 
 
@@ -51,4 +56,5 @@ class MemorySummaryRead(SQLModel):
     user_id: str
     project_id: str
     summary: str
+    author_decisions: list[dict[str, Any]]
     updated_at: datetime

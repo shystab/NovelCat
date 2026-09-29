@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     AI_PROVIDER: str = Field(default="deepseek", description="AI 提供商")
     DEEPSEEK_API_KEY: str | None = Field(default=None, description="DeepSeek API Key")
     DEEPSEEK_BASE_URL: str = Field(default="https://api.deepseek.com", description="DeepSeek API base_url")
-    DEEPSEEK_MODEL: str = Field(default="deepseek-v4-pro", description="DeepSeek 模型")
+    DEEPSEEK_MODEL: str = Field(default="deepseek-flash", description="DeepSeek 模型")
     
     OPENAI_API_KEY: str | None = Field(default=None, description="OpenAI API Key")
     OPENAI_BASE_URL: str = Field(default="https://api.openai.com/v1", description="OpenAI API base_url")

@@ -11,6 +11,12 @@ class ChatMessage(SQLModel):
     content: Annotated[str, Field(description="消息内容")]
 
 
+class DraftReference(SQLModel):
+    label: str = Field(max_length=80)
+    text: str = Field(min_length=1, max_length=24000)
+    scope: Literal["whole", "opening_two", "last_paragraph"] = "whole"
+
+
 class AIWSRequest(SQLModel):
     """
     WebSocket 请求载荷（工具调用模式）。
@@ -22,11 +28,13 @@ class AIWSRequest(SQLModel):
     project_id: str = Field(default="default_project")
     current_chapter_id: int | None = Field(default=None)
     book_id: int | None = Field(default=None)
+    conversation_id: int | None = Field(default=None)
     selected_doc_ids: List[int] = Field(default_factory=list)
     content: str = Field(default="")
     use_memory: bool = Field(default=True)
     max_length: int | None = Field(default=None)
     detailed_analysis: bool = Field(default=False)
+    draft_reference: DraftReference | None = None
     analysis_enabled: bool = Field(default=False)
     analysis_interval_chars: int = Field(default=200)
     analysis_types: List[str] = Field(default_factory=lambda: ["repetition", "length"])

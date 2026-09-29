@@ -4,17 +4,23 @@ AI 服务层 - 通用 AI 服务（工具调用版）
 import json
 import logging
 import re
+import time
 from typing import List
 
 from sqlmodel import Session, select, or_
 from openai.types.chat import ChatCompletionMessageParam
 
-from app.services.ai_provider import BaseAIProvider, get_ai_provider
+from app.services.ai_provider import AIProviderError, BaseAIProvider, get_ai_provider
 from app.services.ai_context import (
     MemoryProfile,
+    OUTPUT_SHAPE_GUIDANCE,
+    STRUCTURED_OUTPUT_PROTOCOL,
+    JSON_WRITING_PROTOCOL,
     chapter_brief,
     clip_text,
+    detect_output_shape,
     detect_memory_profile,
+    is_explicit_author_decision,
     plain_text,
     requests_external_reference,
     split_sentences,
@@ -25,13 +31,20 @@ from app.services.ai_tool_protocol import (
     strip_tool_protocol,
 )
 from app.services.knowledge_service import get_knowledge_service
-from app.crud.memory_crud import get_enabled_preset, get_memory_summary
+from app.services.token_estimate import estimate_tokens
+from app.crud.memory_crud import (
+    append_author_decision,
+    get_enabled_preset,
+    get_memory_summary,
+    upsert_memory_summary,
+)
 from app.crud.preset_crud import get_enabled_preset_new
 from app.crud.crud import get_chapter, get_chapters_by_book
 from app.crud.crud import get_nearby_chapter_summaries
 from app.models.ai import AgentEditOperation, AgentEditPlan
 from app.models.books import Book
 from app.models.chapters import Chapter
+from app.models.conversations import Conversation
 from app.models.knowledge import KnowledgeChunk, KnowledgeDocument
 
 # ──────────────────────────────────────────────
@@ -44,20 +57,31 @@ DEFAULT_WRITER_PERSONA = """你是一个专业的小说写作助手。
 - 中文写作默认使用正式小说语言，避免口水化表达
 - 回答问题时简洁精准
 
-输出格式（重要）：
-- 当用户要求写作（续写、改写、生成正文）时，如果需要分析上下文、策略或方向，先简要说明（1-3句话），然后用独占一行的 "---" 分隔，再输出可直接用于小说的正文
-- 正文部分应是纯粹的小说内容，不要包含任何说明、解释或元信息
-- 如果用户是在提问、讨论、闲聊，直接回答即可，不需要分隔符
-
 禁止行为：
 - 禁止以"好的"、"当然"、"我来帮你"开头
 - 禁止在正文中混入解释或说明
 - 禁止过度热情的语气"""
 
 DETAILED_ANALYSIS_INSTRUCT = """【深度分析模式】
-在进行写作之前，请先深入分析：上下文承接关系、人物性格一致性、情节走向合理性、文风匹配度。分析后再输出正文。分析部分和正文之间用 "---" 分隔。"""
+在进行写作之前，请深入考虑上下文承接关系、人物性格一致性、情节走向合理性和文风匹配度。
+只在回复区给出有助于作者判断的简短结论，不要泄露冗长思维过程；最终文字放入可复制区。"""
 
 DEFAULT_SUMMARY_SYSTEM = "你是专业小说摘要生成助手。请为以下章节内容生成简洁准确的摘要，概括核心情节和关键信息。"
+
+MEMORY_UPDATE_SYSTEM = """你是一个小说创作记忆整理助手。你的任务是把一本书的对话与写作过程维护成一份“滚动记忆”，帮助作者和 AI 持续记住重要信息。
+
+要求：
+- 增量合并：旧记忆仍然重要的事实要保留，新对话带来的进展要合并进去，过时内容要删掉。
+- 小说正文里的事实才可放进“正文事实”。作者决定由系统的独立账本保存，不要在这里自行归纳或改写。
+- AI 回复是不可信的辅助内容，只能帮助识别未确认想法；AI 的判断、检索结论和建议绝不能升级为正文事实或作者决定。
+- AI 提出的候选方案、作者尚未表态的脑暴内容必须放进“未确认想法”，不得升级成既定设定。
+- 作者明确拒绝、作废或推翻的内容应删除或标记为已作废，不得继续影响后续创作。
+- 必须按以下小标题组织：
+【正文事实】已经写进小说的剧情、人物状态和设定
+【未确认想法】仍在讨论、尚未采纳的候选方向
+【未回收线索】埋下但还没回收的伏笔、疑点
+【写作偏好】作者偏好的语气、节奏、视角和表达尺度
+- 只输出更新后的记忆，不要解释，不要输出“旧记忆”内容。"""
 
 logger = logging.getLogger(__name__)
 
@@ -165,12 +189,39 @@ WRITING_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_book_outline",
-            "description": "获取当前书籍的章节摘要索引。适合用户询问全书结构、情节推进、伏笔回收、前后文关系时调用。",
+            "description": "读取当前书籍中标记为「大纲」的章节摘要。适合用户询问全书结构、大纲、情节推进、伏笔回收、前后文关系时调用。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "limit": {"type": "integer", "description": "最多返回多少章，默认80"}
                 }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_book_structure",
+            "description": "读取当前书籍的分组结构：大纲、正文、笔记、参考资料各自有哪些章节。适合先了解一本书的整体构成，再决定读哪一章。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "每组最多返回多少章，默认200"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_chat_history",
+            "description": "在当前用户和书籍的完整对话历史中搜索旧对话内容。适合用户问“我们之前是不是聊过 XX”“之前你给过一个 XX 的建议”时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词或问题"}
+                },
+                "required": ["query"]
             }
         }
     },
@@ -230,10 +281,183 @@ class AIService:
     def _get_memory_context(self, user_id: str, project_id: str) -> str:
         if not self.session:
             return ""
+        self._backfill_author_decisions(user_id, project_id)
         summary = get_memory_summary(self.session, user_id, project_id)
-        if summary and summary.summary.strip():
-            return f"【前情提要】\n{summary.summary.strip()}"
-        return ""
+        if not summary:
+            return ""
+
+        parts: list[str] = []
+        decisions = list(summary.author_decisions or [])
+        if decisions:
+            lines = [
+                "【作者决定账本｜最高优先级】",
+                "以下内容逐字来自作者消息；越靠后的决定越新。新决定可覆盖旧设定文档和旧决定。",
+                "只延续其中明确确认/否定的设定与偏好；消息里的临时任务、篇幅和格式要求不会自动延续到下一轮。",
+            ]
+            for index, item in enumerate(decisions[-20:], 1):
+                decision_text = self._clip_text(str(item.get("text") or ""), 700)
+                if decision_text:
+                    lines.append(f"{index}. {decision_text}")
+            if len(lines) > 3:
+                parts.append("\n".join(lines))
+
+        generated_summary = self._strip_generated_decision_section(summary.summary)
+        if generated_summary:
+            parts.append(f"【书级滚动摘要｜辅助信息】\n{generated_summary}")
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _strip_generated_decision_section(summary: str) -> str:
+        """Ignore legacy model-authored decision sections now that decisions are exact quotes."""
+        value = (summary or "").strip()
+        value = re.sub(
+            r"【已确认决定】[\s\S]*?(?=\n【(?:正文事实|未确认想法|未回收线索|写作偏好)】|\Z)",
+            "",
+            value,
+        )
+        return re.sub(r"\n{3,}", "\n\n", value).strip()
+
+    def record_author_decision(
+        self,
+        *,
+        user_id: str,
+        project_id: str,
+        user_message: str,
+        conversation_id: int | None = None,
+    ) -> bool:
+        """Store explicit author decisions verbatim before any model call."""
+        if not self.session or not is_explicit_author_decision(user_message):
+            return False
+        append_author_decision(
+            self.session,
+            user_id=user_id,
+            project_id=project_id,
+            text=user_message,
+            source_conversation_id=conversation_id,
+        )
+        return True
+
+    def _backfill_author_decisions(self, user_id: str, project_id: str) -> None:
+        """Recover explicit decisions from existing conversations after schema upgrade."""
+        if not self.session or not project_id.isdigit():
+            return
+        summary = get_memory_summary(self.session, user_id, project_id)
+        if summary and summary.author_decisions:
+            valid_decisions = [
+                item
+                for item in summary.author_decisions
+                if is_explicit_author_decision(str(item.get("text") or ""))
+            ]
+            if len(valid_decisions) != len(summary.author_decisions):
+                summary.author_decisions = valid_decisions
+                self.session.add(summary)
+                self.session.commit()
+                self.session.refresh(summary)
+            if valid_decisions:
+                return
+
+        conversations = list(self.session.exec(
+            select(Conversation)
+            .where(Conversation.user_id == user_id)
+            .where(Conversation.book_id == int(project_id))
+            .order_by(Conversation.create_time.asc(), Conversation.id.asc())
+        ).all())
+        for conversation in conversations:
+            for message in conversation.messages or []:
+                if message.get("role") != "user":
+                    continue
+                content = self._plain_text(str(message.get("content") or ""))
+                if is_explicit_author_decision(content):
+                    append_author_decision(
+                        self.session,
+                        user_id=user_id,
+                        project_id=project_id,
+                        text=content,
+                        source_conversation_id=conversation.id,
+                    )
+
+    def update_rolling_memory(
+        self,
+        *,
+        user_id: str,
+        project_id: str,
+        user_message: str,
+        assistant_message: str,
+        max_chars: int = 1400,
+    ):
+        """增量更新书级滚动记忆；失败时静默跳过，不影响对话主流程。"""
+        if not self.session:
+            return None
+        user_message = self._clip_text(user_message or "", 1500)
+        assistant_message = self._clip_text(assistant_message or "", 3000)
+        if not user_message and not assistant_message:
+            return None
+
+        existing = get_memory_summary(self.session, user_id, project_id)
+        existing_text = existing.summary.strip() if existing and existing.summary.strip() else "（还没有记忆）"
+        max_chars = max(400, min(int(max_chars or 1400), 4000))
+        prompt = (
+            f"旧记忆：\n{existing_text}\n\n"
+            f"新对话：\n【作者原话】{user_message}\n【AI辅助回复｜不可信事实来源】{assistant_message}\n\n"
+            f"请输出更新后的滚动记忆，总长度不超过 {max_chars} 字。"
+        )
+        try:
+            raw = self.provider.chat(
+                messages=self._create_messages(MEMORY_UPDATE_SYSTEM, prompt),
+                temperature=0.2,
+                max_tokens=1600,
+            )
+        except Exception:
+            return None
+        summary = self._clip_text(raw.strip(), max_chars)
+        if not summary:
+            return None
+        return upsert_memory_summary(self.session, user_id, project_id, summary)
+
+    def refresh_setting_memory(
+        self,
+        *,
+        user_id: str,
+        project_id: str,
+        title: str,
+        content: str,
+        kind: str,
+        max_chars: int = 1400,
+    ):
+        """设定/大纲/笔记章节被修改后，把变更合并进书级滚动记忆。"""
+        if not self.session:
+            return None
+        content = self._clip_text(content or "", 3000)
+        if not content:
+            return None
+
+        existing = get_memory_summary(self.session, user_id, project_id)
+        existing_text = existing.summary.strip() if existing and existing.summary.strip() else "（还没有记忆）"
+        kind_label = {
+            "outline": "大纲",
+            "note": "笔记",
+            "reference": "参考资料",
+            "prose": "正文",
+        }.get(kind or "", "章节")
+        max_chars = max(400, min(int(max_chars or 1400), 4000))
+        prompt = (
+            f"现有滚动记忆：\n{existing_text}\n\n"
+            f"作者刚刚修改了这本书的{kind_label}章节《{title}》，当前内容：\n{content}\n\n"
+            f"请输出更新后的完整滚动记忆：只更新【正文事实】中受影响的条目，"
+            f"删除已经过时的内容，其他部分保持不变。总长度不超过 {max_chars} 字。只输出记忆本身。"
+        )
+        try:
+            raw = self.provider.chat(
+                messages=self._create_messages(MEMORY_UPDATE_SYSTEM, prompt),
+                temperature=0.2,
+                max_tokens=1600,
+            )
+        except Exception:
+            return None
+        summary = self._clip_text(raw.strip(), max_chars)
+        if not summary:
+            return None
+        return upsert_memory_summary(self.session, user_id, project_id, summary)
 
     def _get_generation_config(self) -> dict:
         config = {"temperature": 0.7, "max_tokens": 1000}
@@ -279,11 +503,18 @@ class AIService:
                 return str(msg["content"]).strip()
         return current_content[-1000:].strip()
 
-    def _prepare_chat_messages(self, messages: List[dict], *, keep_last: int = 16, content_limit: int = 3000) -> List[dict]:
-        """清理和裁剪对话历史，避免长对话拖慢/稀释当前任务。"""
+    def _prepare_chat_messages(
+        self,
+        messages: List[dict],
+        *,
+        keep_last: int = 8,
+        content_limit: int = 2400,
+        token_budget: int = 16000,
+    ) -> List[dict]:
+        """清理对话历史：先保证保留最近若干条，再按 token 预算向后扩展。"""
         allowed_roles = {"user", "assistant", "system", "tool"}
         cleaned: list[dict] = []
-        for msg in messages:
+        for message_index, msg in enumerate(messages):
             role = msg.get("role")
             if role not in allowed_roles:
                 continue
@@ -292,16 +523,29 @@ class AIService:
                 continue
             next_msg = dict(msg)
             if isinstance(content, str):
-                cleaned_content = self._plain_text(strip_tool_protocol(content))
+                # Keep assistant draft boundaries; stripping all XML-like tags
+                # turns previous copy blocks into an unlabelled answer.
+                cleaned_content = strip_tool_protocol(content) if role == "assistant" else self._plain_text(content)
                 if role == "assistant" and not cleaned_content:
                     continue
-                next_msg["content"] = self._clip_text(cleaned_content, content_limit)
+                limit = max(content_limit, 12000) if message_index >= len(messages) - 3 else content_limit
+                next_msg["content"] = self._clip_text(cleaned_content, limit)
             cleaned.append(next_msg)
 
-        if len(cleaned) <= keep_last:
+        if not cleaned:
             return cleaned
 
+        keep_last = max(1, min(int(keep_last or 1), 100))
+        token_budget = max(1, int(token_budget or 16000))
         recent = cleaned[-keep_last:]
+        used = sum(estimate_tokens(str(msg.get("content") or "")) + 4 for msg in recent)
+        for msg in reversed(cleaned[:-keep_last]):
+            cost = estimate_tokens(str(msg.get("content") or "")) + 4
+            if used + cost > token_budget:
+                break
+            recent.insert(0, msg)
+            used += cost
+
         # 如果最早一条是 assistant，去掉它，避免没有对应用户上下文的半截问答。
         if recent and recent[0].get("role") == "assistant":
             recent = recent[1:]
@@ -325,8 +569,15 @@ class AIService:
     @staticmethod
     def _hit_label(hit: dict, fallback: str) -> str:
         meta = hit.get("meta") or {}
+        kind = meta.get("chapter_kind") or meta.get("kind")
+        kind_label = {
+            "outline": "大纲",
+            "prose": "正文",
+            "note": "笔记",
+            "reference": "资料",
+        }.get(kind, "")
         if meta.get("chapter_title"):
-            return str(meta["chapter_title"])
+            return f"{meta['chapter_title']}{('｜' + kind_label) if kind_label else ''}"
         if meta.get("document_id"):
             return f"文档#{meta['document_id']}"
         return fallback
@@ -345,6 +596,115 @@ class AIService:
     def _requests_external_reference(user_query: str) -> bool:
         return requests_external_reference(user_query)
 
+    def _build_complete_book_context(
+        self,
+        *,
+        book_id: int | None,
+        user_id: str,
+        current_chapter_id: int | None,
+        current_content: str,
+        query: str,
+        full_text_budget: int = 28000,
+    ) -> tuple[str, str]:
+        """Build deterministic book context before every chat request.
+
+        Small books include every chapter in full. Large books always include a
+        complete chapter digest, the current/adjacent chapters, and relevant
+        passages. The editor content wins over the saved current chapter.
+        """
+        current_plain = self._plain_text(current_content)
+        if not self.session or not book_id:
+            if current_plain:
+                return (
+                    f"【当前编辑器内容】\n{self._clip_text(current_plain, 18000)}",
+                    "未关联书籍；已读取当前编辑器内容",
+                )
+            return "", "未关联书籍上下文"
+
+        book = self.session.get(Book, book_id)
+        if not book or book.user_id != user_id:
+            return "", "书籍不存在或无权读取"
+
+        chapters = list(self.session.exec(
+            select(Chapter)
+            .where(Chapter.book_id == book_id)
+            .order_by(Chapter.order, Chapter.id)
+        ).all())
+        if not chapters:
+            description = self._plain_text(book.description or "")
+            header = f"【作品】《{book.title}》"
+            if description:
+                header += f"\n简介：{description}"
+            return header, "作品尚无章节"
+
+        kind_labels = {
+            "outline": "大纲",
+            "prose": "正文",
+            "note": "笔记",
+            "reference": "资料",
+        }
+        chapter_texts: list[tuple[Chapter, str]] = []
+        digest_lines: list[str] = []
+        for chapter in chapters:
+            saved_plain = self._plain_text(chapter.content)
+            body = current_plain if chapter.id == current_chapter_id and current_plain else saved_plain
+            chapter_texts.append((chapter, body))
+            label = kind_labels.get(chapter.kind or "prose", chapter.kind or "正文")
+            brief = self._chapter_brief(chapter.title, chapter.summary, body, limit=360)
+            current_mark = "（当前）" if chapter.id == current_chapter_id else ""
+            digest_lines.append(
+                f"- [{chapter.order}]《{chapter.title}》｜{label}{current_mark}：{brief or '暂无内容'}"
+            )
+
+        description = self._plain_text(book.description or "")
+        parts = [f"【作品】《{book.title}》" + (f"\n简介：{description}" if description else "")]
+        parts.append("【全书章节索引】\n" + "\n".join(digest_lines))
+
+        total_chars = sum(len(body) for _, body in chapter_texts)
+        full_text_budget = max(12000, min(int(full_text_budget or 28000), 60000))
+        if total_chars <= full_text_budget:
+            full_sections = []
+            for chapter, body in chapter_texts:
+                label = kind_labels.get(chapter.kind or "prose", chapter.kind or "正文")
+                full_sections.append(
+                    f"【{chapter.order}｜{chapter.title}｜{label}】\n{body or '（暂无内容）'}"
+                )
+            parts.append("【全书正文】\n" + "\n\n".join(full_sections))
+            coverage = f"已读取 {len(chapters)} 个章节及全书正文"
+        else:
+            focus_indexes: set[int] = set()
+            current_index = next(
+                (index for index, (chapter, _) in enumerate(chapter_texts) if chapter.id == current_chapter_id),
+                None,
+            )
+            if current_index is not None:
+                focus_indexes.update({current_index - 1, current_index, current_index + 1})
+            focus_indexes = {index for index in focus_indexes if 0 <= index < len(chapter_texts)}
+
+            focus_sections = []
+            for index in sorted(focus_indexes):
+                chapter, body = chapter_texts[index]
+                label = kind_labels.get(chapter.kind or "prose", chapter.kind or "正文")
+                limit = 14000 if chapter.id == current_chapter_id else 5000
+                focus_sections.append(
+                    f"【{chapter.order}｜{chapter.title}｜{label}】\n{self._clip_text(body, limit) or '（暂无内容）'}"
+                )
+            if current_plain and current_index is None:
+                focus_sections.append(f"【当前编辑器内容】\n{self._clip_text(current_plain, 14000)}")
+            if focus_sections:
+                parts.append("【当前及相邻章节正文】\n" + "\n\n".join(focus_sections))
+
+            if query.strip():
+                related = self.search_my_chapters(query, user_id, book_id, top_k=6)
+                if related and "没有找到" not in related and "还没有" not in related:
+                    parts.append("【本轮相关原文】\n" + related)
+            coverage = (
+                f"已覆盖 {len(chapters)} 个章节摘要；全书约 {total_chars} 字，"
+                "并读取当前、相邻章节及本轮相关原文"
+            )
+
+        return "【全书理解上下文】\n" + "\n\n".join(parts), coverage
+
     def _build_auto_context(
         self,
         *,
@@ -354,52 +714,47 @@ class AIService:
         user_id: str,
         project_id: str,
         book_id: int | None,
+        current_conversation_id: int | None,
         selected_doc_ids: list[int] | None,
-    ) -> str:
-        """为聊天入口选择记忆 profile，并复用统一的分层记忆构建链路。"""
+    ) -> tuple[str, str]:
+        """Build complete book context and optional external reference context."""
         config = self._get_chat_context_config()
         current_plain = self._plain_text(current_content)
         query = self._latest_user_query(messages, current_plain)
         query_for_search = self._build_rag_query(query, current_plain)
-        profile = self._detect_memory_profile(query)
-
-        current_limit = max(
-            int(config["current_chapter_chars"]),
-            int(profile.current_chars),
-        )
-        current_limit = max(500, min(current_limit, 6000))
-
-        # 选中文档只限定 Agent 可检索的资料范围，不代表每轮对话都应自动注入。
-        # 自动注入仅由明确的外部参考意图或用户设置触发，避免资料人物/情节污染本书事实。
-        use_external = bool(config["suggest_use_external_rag"]) or self._requests_external_reference(query)
-        use_chapter_rag = bool(config["chat_use_chapter_rag"]) and bool(profile.use_chapter_rag)
-
-        return self.build_layered_memory_context(
+        book_context, coverage = self._build_complete_book_context(
+            book_id=book_id,
+            user_id=user_id,
             current_chapter_id=current_chapter_id,
             current_content=current_plain,
-            user_id=user_id,
-            project_id=project_id,
-            book_id=book_id,
             query=query_for_search,
-            external_query=query,
-            selected_doc_ids=selected_doc_ids,
-            use_current_chapter=True,
-            max_current_chars=current_limit,
-            use_nearby_summaries=profile.use_nearby,
-            nearby_before=profile.nearby_before,
-            nearby_after=profile.nearby_after,
-            use_rag=bool(profile.rag_top_k) and (use_external or use_chapter_rag),
-            rag_top_k=profile.rag_top_k,
-            use_external_rag=use_external,
-            use_chapter_rag=use_chapter_rag,
-            external_rag_weight=int(config["external_rag_weight"]),
-            use_book_outline=profile.use_book_outline,
-            book_outline_limit=profile.book_outline_limit,
-            use_foreshadowing_scan=profile.use_foreshadowing_scan,
-            foreshadowing_scope=profile.foreshadowing_scope,
-            use_memory_summary=False,
-            context_title=f"自动分层记忆：{profile.label}",
         )
+        parts = [book_context] if book_context else []
+
+        # External material remains opt-in so reference characters and events do
+        # not silently become facts in the author's novel.
+        use_external = bool(config["suggest_use_external_rag"]) or self._requests_external_reference(query)
+        if use_external and query_for_search:
+            external_context = self.build_unified_rag_context(
+                user_id=user_id,
+                project_id=project_id,
+                book_id=book_id,
+                query=query_for_search,
+                external_query=query,
+                top_k=5,
+                use_external=True,
+                use_chapters=False,
+                external_weight=int(config["external_rag_weight"]),
+                selected_doc_ids=selected_doc_ids,
+            )
+            if external_context:
+                parts.append("【用户允许的外部参考】\n" + external_context)
+                coverage += "；已加入外部参考"
+
+        # Only this request's conversation participates in discussion memory.
+        # Other conversations remain available for the author to reopen.
+
+        return "\n\n".join(parts), coverage
 
     # ──────────────────────────────────────────────
     # 信息工具实现（保持不变）
@@ -424,6 +779,13 @@ class AIService:
 
         title = f"《{chapter.title}》" if chapter else "当前编辑器"
         summary = self._chapter_brief(chapter.title, chapter.summary, chapter.content, limit=260) if chapter else ""
+        if chapter and chapter.kind and chapter.kind != "prose":
+            kind_label = {
+                "outline": "大纲",
+                "note": "笔记",
+                "reference": "资料",
+            }.get(chapter.kind, chapter.kind)
+            title = f"{title}【{kind_label}】"
         content = self._clip_text(content, 5000)
         if summary:
             return f"当前章节 {title}\n章节摘要：{summary}\n\n正文：\n{content}"
@@ -448,7 +810,7 @@ class AIService:
             title = item["title"]
             summary = item.get("summary", "无摘要")
             lines.append(f"【{prefix}】《{title}》：{summary}")
-        return "附近章节摘要：\n" + "\n".join(lines)
+        return "附近正文章节摘要：\n" + "\n".join(lines)
 
     def get_recent_chapters(
         self,
@@ -466,6 +828,7 @@ class AIService:
             .join(Book, Book.id == Chapter.book_id)
             .where(Book.user_id == user_id)
             .where(Chapter.book_id == book_id)
+            .where(Chapter.kind == "prose")
         )
         current = None
         if current_chapter_id:
@@ -476,7 +839,7 @@ class AIService:
         chapters.reverse()
         if not chapters:
             return "当前书籍还没有可读取的章节。"
-        lines = [f"最近 {len(chapters)} 章正文（按章节顺序）："]
+        lines = [f"最近 {len(chapters)} 章正文（只含正文类型章节，按章节顺序）："]
         for chapter in chapters:
             content = self._clip_text(self._plain_text(chapter.content), 3200)
             lines.append(f"\n【第 {chapter.order} 章｜{chapter.title}】\n{content or '暂无正文'}")
@@ -503,8 +866,14 @@ class AIService:
         chapter = self.session.exec(stmt).first()
         if not chapter:
             return f"没有找到章节“{reference}”。"
+        kind_label = {
+            "outline": "大纲",
+            "prose": "正文",
+            "note": "笔记",
+            "reference": "资料",
+        }.get(chapter.kind or "prose", chapter.kind or "正文")
         content = self._clip_text(self._plain_text(chapter.content), 5000)
-        return f"《{chapter.title}》正文：\n{content or '暂无正文'}"
+        return f"《{chapter.title}》【{kind_label}】\n{content or '暂无正文'}"
 
     def search_my_chapters(self, query: str, user_id: str, book_id: int | None, top_k: int = 5) -> str:
         """全书章节检索：内部写作上下文，不属于外部语料 RAG。"""
@@ -553,16 +922,54 @@ class AIService:
         }
         label = purpose_labels.get(purpose, purpose_labels["reference"])
         ks = get_knowledge_service()
-        if not ks.vector_enabled:
+        if not ks.ensure_ready():
             return "外部语料向量模型未就绪，无法进行外部 RAG 检索。请先开启并加载 embedding 模型。"
-        hits = ks.search_external(
-            user_id=user_id,
-            project_id=project_id,
-            query=query,
-            top_k=top_k,
-            weight=30,
-            document_ids=selected_doc_ids,
-        )
+
+        # 外部资料目前可以是全局资料（default_project），也可以属于某本书。
+        # AI 对话的 project_id 同时承担书级记忆 ID，不能直接假定资料也在同一集合里。
+        searches: list[tuple[str, list[int] | None]] = []
+        if selected_doc_ids and self.session:
+            documents = self.session.exec(
+                select(KnowledgeDocument)
+                .where(KnowledgeDocument.user_id == user_id)
+                .where(KnowledgeDocument.id.in_(selected_doc_ids))  # type: ignore[union-attr]
+            ).all()
+            docs_by_project: dict[str, list[int]] = {}
+            for document in documents:
+                if document.id is None:
+                    continue
+                docs_by_project.setdefault(document.project_id, []).append(document.id)
+            searches.extend(docs_by_project.items())
+        elif selected_doc_ids:
+            searches.append((project_id, selected_doc_ids))
+        else:
+            searches.append((project_id, None))
+            if project_id != "default_project":
+                searches.append(("default_project", None))
+
+        hits: list[dict] = []
+        for target_project_id, document_ids in searches:
+            hits.extend(ks.search_external(
+                user_id=user_id,
+                project_id=target_project_id,
+                query=query,
+                top_k=top_k,
+                weight=30,
+                document_ids=document_ids,
+            ))
+
+        # 不同资料集合合并后按向量距离统一排序，并去掉重复切片。
+        hits.sort(key=lambda hit: float(hit.get("distance", 1)))
+        unique_hits: list[dict] = []
+        seen: set[tuple[object, str]] = set()
+        for hit in hits:
+            meta = hit.get("meta") or {}
+            key = (meta.get("document_id"), str(hit.get("text") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_hits.append(hit)
+        hits = unique_hits[:top_k]
         if not hits:
             return f"未找到与'{query}'相关的外部参考内容。"
 
@@ -570,6 +977,103 @@ class AIService:
         for i, h in enumerate(hits, 1):
             source = self._hit_label(h, f"资料{i}")
             lines.append(f"[{i} | {source}] {self._clip_text(h.get('text', ''), 560)}")
+        return "\n".join(lines)
+
+    def search_chat_history(
+        self,
+        query: str,
+        user_id: str,
+        project_id: str,
+        top_k: int = 8,
+        current_conversation_id: int | None = None,
+    ) -> str:
+        """在完整对话历史中按关键词召回旧内容（Cold 层记忆）。"""
+        if not self.session:
+            return "当前没有可检索的对话历史。"
+        query = (query or "").strip()
+        if not query:
+            return "没有提供搜索关键词。"
+        top_k = max(1, min(int(top_k or 8), 12))
+        book_id = int(project_id) if project_id and project_id.isdigit() else None
+
+        statement = (
+            select(Conversation)
+            .where(Conversation.user_id == user_id)
+            .order_by(Conversation.update_time.desc())
+            .limit(300)
+        )
+        if book_id is not None:
+            statement = statement.where(Conversation.book_id == book_id)
+        if current_conversation_id is not None:
+            statement = statement.where(Conversation.id != current_conversation_id)
+        conversations = list(self.session.exec(statement).all())
+
+        quoted_terms = [
+            value.strip()
+            for value in re.findall(r"[“\"「『]([^”\"」』]{2,80})[”\"」』]", query)
+            if value.strip()
+        ]
+        segments = [
+            value.strip()
+            for value in re.split(r"[\s，。！？；：、,.!?;:()（）【】]+", query)
+            if len(value.strip()) >= 2
+        ]
+        direct_terms: list[str] = []
+        for term in quoted_terms + segments:
+            if len(term) <= 32 and term not in direct_terms:
+                direct_terms.append(term)
+
+        query_cjk = "".join(re.findall(r"[\u3400-\u9fff]", query))
+        query_ngrams = {
+            query_cjk[index:index + 4]
+            for index in range(max(0, len(query_cjk) - 3))
+        }
+
+        hits: list[dict] = []
+        for conv in conversations:
+            best_hit: dict | None = None
+            for message in conv.messages or []:
+                content = self._plain_text(str(message.get("content") or ""))
+                if not content:
+                    continue
+                lower = content.lower()
+                score = 0
+                for term in direct_terms:
+                    if term.lower() in lower:
+                        score += 20 + min(len(term), 24)
+                content_cjk = "".join(re.findall(r"[\u3400-\u9fff]", content))
+                if query_ngrams and content_cjk:
+                    content_ngrams = {
+                        content_cjk[index:index + 4]
+                        for index in range(max(0, len(content_cjk) - 3))
+                    }
+                    overlap = len(query_ngrams & content_ngrams)
+                    if overlap >= (1 if len(query_cjk) <= 8 else 2):
+                        score += min(overlap, 20)
+                if score:
+                    if message.get("role") == "user":
+                        score += 4
+                    candidate = {
+                        "title": conv.title or "新对话",
+                        "role": message.get("role", "user"),
+                        "text": self._clip_text(content, 320),
+                        "score": score,
+                        "conversation_id": conv.id,
+                    }
+                    if best_hit is None or candidate["score"] > best_hit["score"]:
+                        best_hit = candidate
+            if best_hit:
+                hits.append(best_hit)
+
+        if not hits:
+            return f"没有在对话历史中找到与“{query}”相关的内容。"
+        hits.sort(key=lambda hit: hit["score"], reverse=True)
+        lines = [f"对话历史检索结果（共 {len(hits)} 个对话）："]
+        for i, hit in enumerate(hits[:top_k], 1):
+            role_label = "我" if hit["role"] == "user" else "AI"
+            lines.append(
+                f"[{i} | 对话#{hit['conversation_id']}｜{hit['title']}｜{role_label}] {hit['text']}"
+            )
         return "\n".join(lines)
 
     def _keyword_search_chapters(self, *, user_id: str, book_id: int, query: str, top_k: int) -> list[dict]:
@@ -594,7 +1098,12 @@ class AIService:
         return [
             {
                 "text": self._plain_text(chapter.summary or chapter.content),
-                "meta": {"chapter_id": chapter.id, "chapter_title": chapter.title, "source_type": "keyword"},
+                "meta": {
+                    "chapter_id": chapter.id,
+                    "chapter_title": chapter.title,
+                    "chapter_kind": chapter.kind or "prose",
+                    "source_type": "keyword",
+                },
                 "distance": 0,
             }
             for chapter in chapters
@@ -837,18 +1346,48 @@ class AIService:
             return AgentEditPlan(reply=reply, summary="没有生成可应用的修改方案", risk="low", operations=[])
 
     def get_book_outline(self, book_id: int | None, limit: int = 80) -> str:
-        """返回当前书籍章节摘要索引。"""
+        """返回当前书籍中标记为大纲的章节摘要索引。"""
         if not self.session or not book_id:
             return "当前没有可用的书籍上下文。"
         limit = max(1, min(limit or 80, 200))
+        chapters = [
+            chapter
+            for chapter in get_chapters_by_book(self.session, book_id, limit=limit)
+            if chapter.kind == "outline"
+        ]
+        if not chapters:
+            return "当前书籍还没有标记为「大纲」的章节。作者可以把章节类型改成大纲后，这里就会展示全书结构。"
+
+        lines = [f"当前书籍大纲索引（共 {len(chapters)} 个大纲章节）："]
+        for chapter in chapters:
+            brief = self._chapter_brief(chapter.title, chapter.summary, chapter.content, limit=180)
+            lines.append(f"{chapter.order}. 《{chapter.title}》：{brief}")
+        return "\n".join(lines)
+
+    def get_book_structure(self, book_id: int | None, limit: int = 200) -> str:
+        """返回当前书籍的分组结构，帮助模型先理解整本书的构成。"""
+        if not self.session or not book_id:
+            return "当前没有可用的书籍上下文。"
+        limit = max(1, min(limit or 200, 500))
         chapters = get_chapters_by_book(self.session, book_id, limit=limit)
         if not chapters:
             return "当前书籍还没有章节。"
 
-        lines = [f"当前书籍章节摘要索引（共返回 {len(chapters)} 章）："]
-        for chapter in chapters:
-            brief = self._chapter_brief(chapter.title, chapter.summary, chapter.content, limit=180)
-            lines.append(f"{chapter.order}. 《{chapter.title}》：{brief}")
+        groups = {
+            "outline": "大纲",
+            "prose": "正文",
+            "note": "笔记",
+            "reference": "参考资料",
+        }
+        lines = [f"当前书籍结构（共 {len(chapters)} 个章节）："]
+        for kind, label in groups.items():
+            group = [ch for ch in chapters if (ch.kind or "prose") == kind]
+            if not group:
+                continue
+            lines.append(f"\n【{label}】")
+            for chapter in group:
+                brief = self._chapter_brief(chapter.title, chapter.summary, chapter.content, limit=120)
+                lines.append(f"- {chapter.order}. 《{chapter.title}》：{brief}")
         return "\n".join(lines)
 
     def extract_foreshadowing_candidates(
@@ -911,9 +1450,11 @@ class AIService:
         temperature: float = 0.0,
         current_chapter_id: int | None = None,
         book_id: int | None = None,
+        conversation_id: int | None = None,
         current_content: str = "",
         selected_doc_ids: list[int] | None = None,
         detailed_analysis: bool = False,
+        draft_reference: dict | None = None,
     ):
         messages = self._prepare_chat_messages(messages)
         yield {
@@ -930,18 +1471,15 @@ class AIService:
         # 构建基础 system prompt
         persona = self._get_persona(user_id, project_id, detailed_analysis=detailed_analysis)
         system_content = persona
-        if use_memory:
-            memory_ctx = self._get_memory_context(user_id, project_id)
-            if memory_ctx:
-                system_content = f"{persona}\n\n{memory_ctx}"
 
-        auto_context = self._build_auto_context(
+        auto_context, context_coverage = self._build_auto_context(
             messages=messages,
             current_content=current_content,
             current_chapter_id=current_chapter_id,
             user_id=user_id,
             project_id=project_id,
             book_id=book_id,
+            current_conversation_id=conversation_id,
             selected_doc_ids=selected_doc_ids,
         )
         if auto_context:
@@ -952,24 +1490,53 @@ class AIService:
                     "id": "context-ready",
                     "phase": "context",
                     "status": "completed",
-                    "title": "已准备分层写作上下文",
-                    "detail": "当前章节、附近章节摘要与可用记忆已注入",
+                    "title": "已准备全书上下文",
+                    "detail": context_coverage,
                     "content": self._clip_text(auto_context, 3200),
                 },
             }
 
+        output_shape = detect_output_shape(self._latest_user_query(messages, current_content))
+        structured_writing = getattr(self.provider, "supports_structured_writing", False) is True
+        output_protocol = JSON_WRITING_PROTOCOL if structured_writing else STRUCTURED_OUTPUT_PROTOCOL
+        system_content = (
+            f"{system_content}\n\n"
+            f"{OUTPUT_SHAPE_GUIDANCE.get(output_shape, OUTPUT_SHAPE_GUIDANCE['chat'])}\n\n"
+            f"{output_protocol}"
+        )
+
         context_rules = [
             "【上下文使用规则】",
-            "- 当前编辑器内容优先于历史对话。",
+            "- 作品文档是长期依据；只使用当前对话中的讨论，不读取也不继承其他聊天的决定或草稿。",
+            "- 当前对话中作者明确采纳的修改只用于本次讨论；如果文档尚未同步，指出差异，不声称已保存。",
+            "- 用户提出假设、问句或尝试一种写法不等于修改全书设定；冲突请求先说明冲突。",
+            "- 新对话以作品文档为准；询问其他聊天时，说明需要打开原对话或提供相关内容，不能声称已搜索。",
+            "- 润色和续写保留时间、距离、惯用手、持有物等连续性；上一版、第二段指当前对话中的草稿。",
+            "- 仅修改指定句段时，其余原文逐字保留；无法看到所指版本的完整原文时，先请作者提供，不得凭记忆补造。",
+            "- 以本轮输出协议为准，不模仿历史回答中缺失、错误或不完整的标签。",
             "- 外部资料不是当前小说事实。未经用户明确要求，不得引入其中的人名、关系、事件、设定或时间线。",
             "- 外部资料仅可提炼风格或提供参考信息，禁止直接复制；与本书内容冲突时以本书为准。",
-            "- 回答续写/改写类请求时，只输出可放入正文的内容，除非用户明确要求解释。",
+            "- 全书章节索引用于保证整体覆盖；当前章节、相邻章节和相关原文用于精确判断。",
+            "- 当前对话近期消息保留原文；不要把未采纳的草稿当作已写入作品的情节。",
+            "- AI 曾提出但作者没有明确采纳的方案，不得当作小说既定事实。",
+            "- <NOVELCAT_PREVIOUS_COPY> 是此前 AI 草稿的只读上下文标签；不得在最终回答中输出标签或无条件重复整段旧稿。",
         ]
         if selected_doc_ids:
             context_rules.append("- 用户已选择可用参考语料；这只限定外部检索范围，不代表本轮必须使用这些资料。")
         if book_id:
-            context_rules.append("- 如需回顾伏笔、人物或设定，可参考全书相关片段。")
+            context_rules.append("- 本轮提供了作品上下文；只对实际提供的原文作精确引用，摘要、索引或截断内容不代表完整原文。")
         system_content = f"{system_content}\n\n" + "\n".join(context_rules)
+        if draft_reference:
+            from app.services.draft_revision import revision_range
+            revision = revision_range(draft_reference["text"], draft_reference["scope"])
+            system_content += "\n【作者明确选中的回复稿，仅为本次讨论资料，不是作品已采纳内容】\n" + json.dumps(draft_reference, ensure_ascii=False)
+            if revision.scope != "whole":
+                system_content += (
+                    "\n【局部修改契约】以作者选择的范围为准。copy 字段只输出以下目标范围的替换文字，"
+                    "绝不能输出整稿。程序会把替换文字拼回原稿并保留其他部分。若本轮要求与范围矛盾，遵守选定范围。"
+                    "开头两句必须恰好两句，最后一段必须恰好一个段落。reply 简短说明。\n目标原文："
+                    + json.dumps(revision.target, ensure_ascii=False)
+                )
 
         # 添加可用工具说明，帮助AI知道何时调用RAG工具
         tool_instructions = """
@@ -992,16 +1559,23 @@ class AIService:
 
 5. search_external_reference - 仅在用户明确要求使用外部资料、参考文风、设定或范例时检索。purpose=style 时用于文风参考，purpose=setting/plot/reference 用于设定、情节范例或通用资料。检索结果不是当前小说事实。
 
-6. get_book_outline - 读取全书章节摘要索引。用于全书结构、节奏、人物线、伏笔回收和前后文关系。
+6. get_book_structure - 读取全书分组结构（大纲/正文/笔记/资料）。用于先了解整本书的构成，再决定读哪一章。
 
-6. extract_foreshadowing_candidates - 扫描伏笔/悬念候选句。用于伏笔、埋线、疑点、回收线索。
+7. get_book_outline - 读取标记为「大纲」的章节摘要。用于全书结构、节奏、人物线、伏笔回收和前后文关系。
+
+8. extract_foreshadowing_candidates - 扫描伏笔/悬念候选句。用于伏笔、埋线、疑点、回收线索。
+
+9. search_chat_history - 在当前用户和书籍的完整对话历史中搜索旧对话。用于“之前是不是聊过 XX”这类回忆。
 
 使用指南：
 - 普通续写/润色优先使用自动分层记忆，除非上下文明显不足。
 - 总结本章时可调用 get_current_chapter。
+- 章节有类型：大纲(outline)、正文(prose)、笔记(note)、资料(reference)。get_nearby_chapters_summary 和 get_recent_chapters 只读取正文类型章节。
 - 近几章承接问题调用 get_nearby_chapters_summary。
 - 评价最近几章、查看“这五章”或比较连续章节时调用 get_recent_chapters。
-- 全书一致性、伏笔、人物、设定问题调用 search_my_chapters 或 get_book_outline。
+- 不确定书里有什么时先调用 get_book_structure；全书一致性、伏笔、人物、设定问题调用 search_my_chapters。
+- 结构、大纲、节奏、伏笔回收问题调用 get_book_outline（只包含大纲章节）。
+- 用户问“之前聊过/你之前说过/我记得讨论过”时，调用 search_chat_history 精确召回旧对话，不要凭空猜测。
 - 用户明确要求文风参考、外部设定、资料或范例时，才调用 search_external_reference，并设置合适 purpose。
 - 选中外部资料只表示允许检索，不表示必须检索；普通续写、润色和本书问题不要调用外部检索。
 - 伏笔、悬念、疑点、埋线问题调用 extract_foreshadowing_candidates；必要时再结合 get_book_outline 判断是否已回收。
@@ -1009,10 +1583,12 @@ class AIService:
 - 如果你不确定用户需要什么信息，可以先调用相关工具获取上下文再回答
 - 工具只用于补充上下文；最终的续写、改写、检查、情节建议都由你在最终回复中直接生成
 """
-        system_content = f"{system_content}\n{tool_instructions}"
+        # Context assembly is deterministic now. The legacy tool catalogue is
+        # intentionally not added to the final prompt, and the planning loop
+        # below is disabled so the model cannot skip reading the novel.
 
-        # Agent 最多进行三轮工具决策；现有工具和分层记忆保持不变。
-        for round_index in range(3):
+        # 只做一轮工具决策：模型可以在同一轮返回多个工具调用，避免多轮串行拖慢响应。
+        for round_index in range(0):
             planning_id = f"planning-{round_index + 1}"
             yield {
                 "type": "agent_step",
@@ -1024,6 +1600,7 @@ class AIService:
                     "detail": f"第 {round_index + 1} 轮工具决策",
                 },
             }
+            plan_started = time.perf_counter()
             try:
                 response_str = self.provider.chat(
                     messages=[{"role": "system", "content": system_content}] + messages,
@@ -1046,6 +1623,7 @@ class AIService:
                         "status": "completed",
                         "title": "上下文已经足够",
                         "detail": "开始组织最终回答",
+                        "elapsed_ms": int((time.perf_counter() - plan_started) * 1000),
                     },
                 }
                 break
@@ -1058,6 +1636,7 @@ class AIService:
                     "status": "completed",
                     "title": f"决定调用 {len(tool_calls)} 个工具",
                     "detail": f"第 {round_index + 1} 轮工具决策完成",
+                    "elapsed_ms": int((time.perf_counter() - plan_started) * 1000),
                 },
             }
             messages.append({
@@ -1089,6 +1668,12 @@ class AIService:
                     tool_call_id = tc.get("id", f"call_{round_index}_{tool_index}_{tool_name}")
                     step_id = f"tool-{round_index}-{tool_call_id}"
                     query = str(args.get("query") or "")
+                    safe_args: dict[str, str | int | float | bool] = {}
+                    for key, value in (args or {}).items():
+                        if isinstance(value, str):
+                            safe_args[key] = value[:200]
+                        elif isinstance(value, (int, float, bool)):
+                            safe_args[key] = value
                     yield {
                         "type": "agent_step",
                         "step": {
@@ -1098,10 +1683,12 @@ class AIService:
                             "title": tool_name,
                             "detail": query or "正在读取写作上下文",
                             "query": query,
+                            "args": safe_args,
                         },
                     }
 
                     result = ""  # 初始化默认值
+                    tool_started = time.perf_counter()
 
                     try:
                         if tool_name == "get_current_chapter":
@@ -1137,6 +1724,15 @@ class AIService:
                             )
                         elif tool_name == "get_book_outline":
                             result = self.get_book_outline(book_id, int(args.get("limit", 80) or 80))
+                        elif tool_name == "get_book_structure":
+                            result = self.get_book_structure(book_id, int(args.get("limit", 200) or 200))
+                        elif tool_name == "search_chat_history":
+                            result = self.search_chat_history(
+                                args.get("query", ""),
+                                user_id,
+                                project_id,
+                                current_conversation_id=conversation_id,
+                            )
                         elif tool_name == "extract_foreshadowing_candidates":
                             result = self.extract_foreshadowing_candidates(
                                 scope=args.get("scope", "current") or "current",
@@ -1160,6 +1756,8 @@ class AIService:
                             "title": tool_name,
                             "detail": query or "工具调用完成",
                             "query": query,
+                            "args": safe_args,
+                            "elapsed_ms": int((time.perf_counter() - tool_started) * 1000),
                             "content": self._clip_text(result, 3200),
                         },
                     }
@@ -1175,28 +1773,57 @@ class AIService:
             },
         }
         full_messages = [{"role": "system", "content": system_content}] + messages
+        if structured_writing:
+            # Keep historical answers in the same format as the next answer,
+            # so legacy XML wrappers cannot become malformed few-shot examples.
+            for index, message in enumerate(full_messages):
+                if message.get("role") != "assistant":
+                    continue
+                content = str(message.get("content") or "")
+                reply = re.search(r"<NOVELCAT_REPLY>\s*([\s\S]*?)\s*</NOVELCAT_REPLY>", content)
+                copy = re.search(r"<NOVELCAT_COPY>\s*([\s\S]*?)\s*</NOVELCAT_COPY>", content)
+                if reply and copy:
+                    full_messages[index] = {**message, "content": json.dumps(
+                        {"reply": reply.group(1), "copy": copy.group(1)}, ensure_ascii=False)}
         gen_config = self._get_generation_config()
+        gen_started = time.perf_counter()
         final_stream = self.provider.stream_chat(
             messages=full_messages,
             temperature=temperature or gen_config["temperature"],
             max_tokens=max_tokens or gen_config["max_tokens"],
+            structured_output=structured_writing,
         )
-        pending = ""
-        leaked_protocol = False
+        yielded_any = False
         for chunk in final_stream:
-            pending += chunk
-            if contains_tool_protocol(pending):
-                leaked_protocol = True
+            if not chunk or not chunk.strip():
+                if yielded_any:
+                    yield chunk
                 continue
-            if len(pending) >= 128 or "\n" in pending:
-                yield pending
-                pending = ""
-        if leaked_protocol:
-            logger.warning("Suppressed leaked tool protocol from final model response")
-            safe_text = strip_tool_protocol(pending)
-            yield safe_text or "我没能完成这次章节读取，请重新生成一次。"
-        elif pending:
-            yield pending
+            if contains_tool_protocol(chunk):
+                logger.warning("Suppressed leaked tool protocol from final response")
+                safe_text = strip_tool_protocol(chunk)
+                if safe_text:
+                    yielded_any = True
+                    yield safe_text
+                elif not yielded_any:
+                    yielded_any = True
+                    yield "我没能完成这次内容生成，请重新生成一次。"
+                continue
+            yielded_any = True
+            yield chunk
+        if not yielded_any:
+            raise AIProviderError("模型未返回可用文字。请重试；若重复出现，请检查模型配置或输出 token 上限。")
+        yield {
+            "type": "agent_step",
+            "step": {
+                "id": "generating-answer",
+                "phase": "generating",
+                "status": "completed",
+                "title": "回答生成完成",
+                "detail": "已输出最终回答",
+                "elapsed_ms": int((time.perf_counter() - gen_started) * 1000),
+            },
+        }
 
     # ──────────────────────────────────────────────
     # 其他写作辅助能力：外部语料检索、轻量分析、续写、摘要和分层记忆。
@@ -1228,7 +1855,7 @@ class AIService:
 
         # 1. 外部知识库检索
         if use_external:
-            if not ks.vector_enabled:
+            if not ks.ensure_ready():
                 lines.append("【外部语料】向量模型未就绪，本次不会使用外部资料。")
             else:
                 try:
@@ -1544,10 +2171,8 @@ class AIService:
                 parts.append("【第5层：伏笔/疑点候选】\n" + foreshadowing)
 
         # 6. 写作记忆摘要（对话历史）
-        if use_memory_summary:
-            memory_ctx = self._get_memory_context(user_id, project_id)
-            if memory_ctx:
-                parts.append("【长期写作记忆】\n" + memory_ctx)
+        # Legacy cross-conversation summaries are retained in storage but no
+        # longer injected into any writing workflow.
 
         if not parts:
             return ""
